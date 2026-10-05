@@ -1,0 +1,25 @@
+{
+  "$comment": "Closed local telemetry schema, v1. Events are written locally to state/telemetry/events.jsonl. No network sending exists in this kit.",
+  "version": 1,
+  "additionalProperties": false,
+  "fields": {
+    "v": { "type": "integer", "const": 1 },
+    "ts": { "type": "string", "format": "UTC timestamp, yyyy-MM-ddTHH:mm:ssZ" },
+    "run": { "type": "string", "pattern": "^[0-9a-f]{8}$", "note": "pseudo-random run id, not derived from the machine or the person" },
+    "ev": { "type": "string", "enum": ["run_start", "check", "run_end"] },
+    "id": {
+      "type": "string",
+      "enum": ["kit", "os", "vscode", "ext_remote_ssh", "ext_claude", "ext_codex", "ssh_client", "prev_state", "map", "workspace", "vpn", "perm_claude", "perm_codex"],
+      "note": "only on ev=check"
+    },
+    "st": {
+      "type": "string",
+      "enum": ["PASS", "FAIL", "NOT_FOUND", "UNKNOWN", "BLOCKED_BY_LOCAL_PERMISSION", "NOT_RUN"],
+      "note": "only on ev=check"
+    },
+    "exec_ms": { "type": ["integer", "null"], "note": "execution time of the script step; bash branch has 1-second resolution" },
+    "wait_ms": { "type": ["integer", "null"], "note": "time spent waiting for a human; the scripts leave it null; an agent-side recorder is not implemented" }
+  },
+  "forbidden_content": ["commands", "tool output", "file paths", "IP addresses or host names", "user names", "secrets", "free text"],
+  "status": "local events only; receiver, HTTPS sending and dashboard are NOT implemented; full telemetry is NOT claimed"
+}

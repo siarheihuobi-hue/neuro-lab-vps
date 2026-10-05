@@ -1,0 +1,885 @@
+#!/usr/bin/env bash
+# vps-preflight — read-only diagnostic check for a VPS (FOREIGN or RU role).
+# Kit copy of an earlier in-house preflight script (version 1.2.0). Kit patches: the public IP is never printed or written to the JSON report; provider names removed from comments/help.
+# Usage: ./vps-preflight <foreign|ru> [--name=<server_name>] [--provider=<provider>] [--country=<country>] [--json=<path>]
+#
+# Design rules (do not violate when editing):
+#  - Read-only. Never changes system state, firewall, ssh config, packages.
+#  - Never prints secrets, private keys, API keys, tokens.
+#  - Never claims something it cannot verify from inside the VPS (e.g. static/dedicated IP) as PASS —
+#    such findings are reported as UNKNOWN/WARNING with an explanation.
+#  - Must not crash when a utility (ufw, ss, apt, systemctl, dig...) is missing — report UNKNOWN instead.
+#  - Prefers sshd's own effective configuration ('sshd -T') over parsing sshd_config directly —
+#    file-parsing (which cannot reliably resolve Include/drop-in order) is only a fallback, and is
+#    capped at WARNING/UNKNOWN, never PASS, for the security-critical directives.
+#  - Two separate readiness verdicts, not one: PRE-BOOTSTRAP READY (safe to continue configuring —
+#    missing hardening is NOT a blocker here) and SECURITY-BASELINE READY (the actual security baseline met).
+#  - Generic NETWORK checks are role-neutral. AI-provider-specific reachability (Claude/Codex
+#    endpoints) is a separate "AI NETWORK READINESS" block, FOREIGN role only, reachability-only —
+#    never attempts any login/auth.
+
+set -u
+set -o pipefail
+
+SCRIPT_VERSION="1.2.0"
+
+# ---------- output helpers ----------
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+  C_PASS="$(tput setaf 2)"; C_WARN="$(tput setaf 3)"; C_FAIL="$(tput setaf 1)"
+  C_UNK="$(tput setaf 6)"; C_BOLD="$(tput bold)"; C_RESET="$(tput sgr0)"
+else
+  C_PASS=""; C_WARN=""; C_FAIL=""; C_UNK=""; C_BOLD=""; C_RESET=""
+fi
+
+# Parallel arrays: one entry per recorded check.
+CHECK_SECTION=()
+CHECK_NAME=()
+CHECK_STATUS=()   # PASS | WARN | FAIL | UNKNOWN
+CHECK_VALUE=()     # short value shown on the result line, e.g. "24.04 LTS"
+CHECK_DETAIL=()    # longer explanation, shown only for WARN/FAIL/UNKNOWN
+
+record() {
+  # record <section> <name> <status> <value> <detail>
+  CHECK_SECTION+=("$1")
+  CHECK_NAME+=("$2")
+  CHECK_STATUS+=("$3")
+  CHECK_VALUE+=("$4")
+  CHECK_DETAIL+=("${5:-}")
+}
+
+status_symbol() {
+  case "$1" in
+    PASS) printf '%s' "${C_PASS}✓${C_RESET}" ;;
+    WARN) printf '%s' "${C_WARN}⚠${C_RESET}" ;;
+    FAIL) printf '%s' "${C_FAIL}✗${C_RESET}" ;;
+    *)    printf '%s' "${C_UNK}?${C_RESET}" ;;
+  esac
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------- effective SSH configuration helpers ----------
+#
+# get_ssh_directive <keyword> sets DIRECTIVE_VALUE and DIRECTIVE_METHOD ("effective"/"fallback"/"none").
+# "effective" = read from 'sshd -T' (sshd's own resolved config — authoritative, requires root/sudo).
+# "fallback"  = best-effort parse of sshd_config + Include files, first-match-wins, stops at any
+#               'Match' block (conditional directives are not safely flattened). NOT authoritative —
+#               callers must never turn this into a PASS on a security-critical directive.
+
+SSHD_METHOD="none"
+SSHD_T_RAW=""
+
+fetch_effective_sshd_config() {
+  if ! have_cmd sshd; then
+    return
+  fi
+  if [ "$IS_ROOT" -eq 1 ]; then
+    SSHD_T_RAW="$(sshd -T 2>/dev/null)"
+  elif [ "$SUDO_NONINTERACTIVE" -eq 1 ] && have_cmd sudo; then
+    SSHD_T_RAW="$(sudo -n sshd -T 2>/dev/null)"
+  fi
+  if [ -n "$SSHD_T_RAW" ]; then
+    SSHD_METHOD="effective"
+  else
+    SSHD_METHOD="fallback"
+  fi
+}
+
+sshd_effective_get() {
+  printf '%s\n' "$SSHD_T_RAW" | awk -v k="$1" 'tolower($1)==k{print $2; exit}'
+}
+
+SSHD_FALLBACK_DEPTH_LIMIT=4
+
+sshd_fallback_lines() {
+  # $1 = file path, $2 = current recursion depth. Prints resolved global-scope directive lines
+  # (Include expanded in place, stops at first Match block) in file order.
+  local file="$1" depth="$2" line trimmed kw pattern f
+  [ "$depth" -gt "$SSHD_FALLBACK_DEPTH_LIMIT" ] && return 0
+  [ -r "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    case "$trimmed" in
+      ''|'#'*) continue ;;
+    esac
+    kw="$(printf '%s' "$trimmed" | awk '{print tolower($1)}')"
+    if [ "$kw" = "match" ]; then
+      return 0
+    fi
+    if [ "$kw" = "include" ]; then
+      pattern="$(printf '%s' "$trimmed" | cut -d' ' -f2-)"
+      case "$pattern" in
+        /*) : ;;
+        *) pattern="/etc/ssh/$pattern" ;;
+      esac
+      for f in $pattern; do
+        [ -e "$f" ] && sshd_fallback_lines "$f" "$((depth + 1))"
+      done
+    else
+      printf '%s\n' "$trimmed"
+    fi
+  done < "$file"
+}
+
+sshd_fallback_get() {
+  local key_lc
+  key_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  sshd_fallback_lines "/etc/ssh/sshd_config" 0 2>/dev/null | awk -v k="$key_lc" 'tolower($1)==k{print $2; exit}'
+}
+
+DIRECTIVE_VALUE=""
+DIRECTIVE_METHOD="none"
+
+get_ssh_directive() {
+  local key="$1" val=""
+  if [ "$SSHD_METHOD" = "effective" ]; then
+    val="$(sshd_effective_get "$key")"
+    if [ -n "$val" ]; then
+      DIRECTIVE_VALUE="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+      DIRECTIVE_METHOD="effective"
+      return 0
+    fi
+  fi
+  val="$(sshd_fallback_get "$key")"
+  if [ -n "$val" ]; then
+    DIRECTIVE_VALUE="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+    DIRECTIVE_METHOD="fallback"
+  else
+    DIRECTIVE_VALUE=""
+    DIRECTIVE_METHOD="none"
+  fi
+}
+
+# ---------- AI provider reachability (FOREIGN only, reachability-only, never auth) ----------
+
+check_ai_endpoint() {
+  local domain="$1" dns_ok=0 https_ok=0 have_dns_tool=0 have_curl_tool=0 code=""
+  have_cmd curl && have_curl_tool=1
+  if have_cmd getent; then
+    have_dns_tool=1
+    getent hosts "$domain" >/dev/null 2>&1 && dns_ok=1
+  elif have_cmd nslookup; then
+    have_dns_tool=1
+    nslookup "$domain" >/dev/null 2>&1 && dns_ok=1
+  elif have_cmd dig; then
+    have_dns_tool=1
+    dig +short "$domain" >/dev/null 2>&1 && dns_ok=1
+  fi
+  if [ "$have_curl_tool" -eq 1 ]; then
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "https://${domain}" 2>/dev/null)"
+    [ -n "$code" ] && https_ok=1
+  fi
+  if [ "$dns_ok" -eq 1 ] && [ "$https_ok" -eq 1 ]; then
+    record "AI NETWORK READINESS" "$domain" PASS "reachable (HTTP $code)" ""
+  elif [ "$have_dns_tool" -eq 0 ] && [ "$have_curl_tool" -eq 0 ]; then
+    record "AI NETWORK READINESS" "$domain" UNKNOWN "n/a" "No DNS/curl tools available to test."
+  elif [ "$dns_ok" -eq 0 ] && [ "$have_dns_tool" -eq 1 ]; then
+    record "AI NETWORK READINESS" "$domain" FAIL "DNS failed" "Could not resolve $domain — check DNS / provider filtering."
+  else
+    record "AI NETWORK READINESS" "$domain" FAIL "HTTPS unreachable" "DNS resolved but the HTTPS request to $domain failed or was blocked. This is reachability only — no login was attempted."
+  fi
+}
+
+# ---------- argument parsing ----------
+
+ROLE=""
+SERVER_NAME="UNKNOWN"
+PROVIDER="UNKNOWN"
+COUNTRY="UNKNOWN"
+JSON_PATH=""
+
+usage() {
+  cat <<'EOF'
+vps-preflight — read-only diagnostic check for a VPS.
+
+Usage:
+  ./vps-preflight foreign [options]
+  ./vps-preflight ru [options]
+
+Options:
+  --name=<server_name>    Label for this server in the report (default: UNKNOWN)
+  --provider=<provider>   Provider name, any provider name (default: UNKNOWN)
+  --country=<country>     Country/location, as you know it (default: UNKNOWN)
+  --json=<path>           Where to write the machine-readable report
+                           (default: ./vps-preflight-report-<role>.json)
+  -h, --help              Show this help and exit
+
+The tool never changes system state and never prints secrets.
+It honestly reports UNKNOWN when something cannot be determined from inside the VPS
+(e.g. whether the public IP is a dedicated/static IP — that cannot be proven locally).
+
+Two readiness verdicts are printed at the end: PRE-BOOTSTRAP READY (safe to continue
+configuring — missing firewall/hardening is NOT a blocker here) and SECURITY-BASELINE READY (the
+actual security baseline: key-only SSH, no root login, firewall active and matching
+the real SSH port).
+EOF
+}
+
+if [ "$#" -eq 0 ]; then
+  usage
+  exit 1
+fi
+
+case "$1" in
+  foreign|FOREIGN) ROLE="FOREIGN" ;;
+  ru|RU)           ROLE="RU" ;;
+  -h|--help)       usage; exit 0 ;;
+  *)
+    echo "Unknown role: $1 (expected 'foreign' or 'ru')" >&2
+    usage
+    exit 1
+    ;;
+esac
+shift
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --name=*)     SERVER_NAME="${1#--name=}" ;;
+    --provider=*) PROVIDER="${1#--provider=}" ;;
+    --country=*)  COUNTRY="${1#--country=}" ;;
+    --json=*)     JSON_PATH="${1#--json=}" ;;
+    -h|--help)    usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+  shift
+done
+
+if [ -z "$JSON_PATH" ]; then
+  JSON_PATH="./vps-preflight-report-$(printf '%s' "$ROLE" | tr '[:upper:]' '[:lower:]').json"
+fi
+
+TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+
+# ================= SYSTEM =================
+
+OS_ID="unknown"; OS_NAME="unknown"; OS_VERSION="unknown"
+if [ -r /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release 2>/dev/null
+  OS_ID="${ID:-unknown}"
+  OS_NAME="${PRETTY_NAME:-${NAME:-unknown}}"
+  OS_VERSION="${VERSION_ID:-unknown}"
+  record SYSTEM "OS" PASS "$OS_NAME" ""
+else
+  record SYSTEM "OS" UNKNOWN "n/a" "/etc/os-release not readable — cannot identify distribution."
+fi
+
+ARCH="$(uname -m 2>/dev/null || echo unknown)"
+case "$ARCH" in
+  x86_64|amd64)     record SYSTEM "Architecture" PASS "$ARCH" ;;
+  aarch64|arm64)    record SYSTEM "Architecture" PASS "$ARCH" ;;
+  "" | unknown)     record SYSTEM "Architecture" UNKNOWN "unknown" "uname -m did not return a value." ;;
+  *)                record SYSTEM "Architecture" WARN "$ARCH" "Uncommon architecture — verify Claude Code / Codex support before the next steps." ;;
+esac
+
+if have_cmd nproc; then
+  CPU_COUNT="$(nproc --all 2>/dev/null || nproc 2>/dev/null || echo 0)"
+elif [ -r /proc/cpuinfo ]; then
+  CPU_COUNT="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 0)"
+else
+  CPU_COUNT=0
+fi
+if [ "$CPU_COUNT" -gt 0 ] 2>/dev/null; then
+  record SYSTEM "CPU" PASS "${CPU_COUNT} vCPU" ""
+else
+  CPU_COUNT=0
+  record SYSTEM "CPU" UNKNOWN "n/a" "Could not read CPU count (no nproc, no /proc/cpuinfo)."
+fi
+
+RAM_MB=0
+if [ -r /proc/meminfo ]; then
+  RAM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  if [ -n "$RAM_KB" ] && [ "$RAM_KB" -gt 0 ] 2>/dev/null; then
+    RAM_MB=$((RAM_KB / 1024))
+  fi
+fi
+if [ "$RAM_MB" -gt 0 ]; then
+  RAM_GB_DISPLAY="$(awk -v mb="$RAM_MB" 'BEGIN{printf "%.1f", mb/1024}')"
+  record SYSTEM "RAM" PASS "${RAM_GB_DISPLAY} GB" ""
+else
+  record SYSTEM "RAM" UNKNOWN "n/a" "/proc/meminfo not readable — could not determine RAM."
+fi
+
+DISK_TOTAL_GB=0; DISK_FREE_GB=0
+if have_cmd df; then
+  DISK_LINE="$(df -Pk / 2>/dev/null | tail -1)"
+  if [ -n "$DISK_LINE" ]; then
+    DISK_TOTAL_KB="$(printf '%s' "$DISK_LINE" | awk '{print $2}')"
+    DISK_FREE_KB="$(printf '%s' "$DISK_LINE" | awk '{print $4}')"
+    if [ -n "$DISK_TOTAL_KB" ] && [ "$DISK_TOTAL_KB" -gt 0 ] 2>/dev/null; then
+      DISK_TOTAL_GB="$(awk -v kb="$DISK_TOTAL_KB" 'BEGIN{printf "%.0f", kb/1024/1024}')"
+      DISK_FREE_GB="$(awk -v kb="$DISK_FREE_KB" 'BEGIN{printf "%.0f", kb/1024/1024}')"
+      record SYSTEM "Disk" PASS "${DISK_TOTAL_GB} GB total, ${DISK_FREE_GB} GB free" ""
+    else
+      record SYSTEM "Disk" UNKNOWN "n/a" "df output could not be parsed."
+    fi
+  else
+    record SYSTEM "Disk" UNKNOWN "n/a" "df returned no output for /."
+  fi
+else
+  record SYSTEM "Disk" UNKNOWN "n/a" "df command not found."
+fi
+
+if [ -r /proc/uptime ]; then
+  UPTIME_SEC="$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)"
+  UPTIME_H=$((UPTIME_SEC / 3600))
+  record SYSTEM "Uptime" PASS "${UPTIME_H}h" ""
+elif have_cmd uptime; then
+  record SYSTEM "Uptime" PASS "$(uptime -p 2>/dev/null || uptime 2>/dev/null)" ""
+else
+  record SYSTEM "Uptime" UNKNOWN "n/a" "No /proc/uptime and no uptime command."
+fi
+
+# ================= ACCESS (part 1: identity, needed before effective-config fetch) =================
+
+CURRENT_USER="$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)"
+record ACCESS "Current user" PASS "$( [ "$(id -u 2>/dev/null || echo 1)" = "0" ] && echo root || echo regular-user )" ""
+
+IS_ROOT=0
+if [ "$(id -u 2>/dev/null || echo -1)" = "0" ]; then IS_ROOT=1; fi
+if [ "$IS_ROOT" -eq 1 ]; then
+  record ACCESS "Root/non-root" WARN "root" "You are running as root. Best practice is a non-root sudo user for daily work — see procedures/ssh-hardening.md and stages/04-access-prep.md."
+else
+  record ACCESS "Root/non-root" PASS "non-root" ""
+fi
+
+SUDO_NONINTERACTIVE=0
+if [ "$IS_ROOT" -eq 1 ]; then
+  record ACCESS "Sudo" PASS "n/a (already root)" ""
+elif have_cmd sudo; then
+  if sudo -n true 2>/dev/null; then
+    SUDO_NONINTERACTIVE=1
+    record ACCESS "Sudo" PASS "available (cached/no password)" ""
+  else
+    if id -nG "$CURRENT_USER" 2>/dev/null | tr ' ' '\n' | grep -qE '^(sudo|wheel)$'; then
+      record ACCESS "Sudo" WARN "group membership present, not verified" "User is in sudo/wheel group but a non-interactive sudo check failed (a password may be required). This is expected and fine — just confirm manually with 'sudo -v'."
+    else
+      record ACCESS "Sudo" UNKNOWN "n/a" "Could not confirm sudo access without prompting for a password. Run 'sudo -v' manually to check."
+    fi
+  fi
+else
+  record ACCESS "Sudo" UNKNOWN "n/a" "sudo command not found on this system."
+fi
+
+fetch_effective_sshd_config
+
+# ================= ACCESS (part 2: SSH auth directives, via effective config or fallback) =================
+
+get_ssh_directive "pubkeyauthentication"
+case "$DIRECTIVE_METHOD" in
+  effective)
+    if [ "$DIRECTIVE_VALUE" = "yes" ]; then
+      record ACCESS "SSH key authentication" PASS "enabled (sshd -T)" ""
+    else
+      record ACCESS "SSH key authentication" FAIL "disabled (sshd -T)" "PubkeyAuthentication is effectively 'no' — key-based login will not work."
+    fi
+    ;;
+  fallback)
+    record ACCESS "SSH key authentication" WARN "appears '${DIRECTIVE_VALUE}' (file parse only)" "Could not confirm via 'sshd -T' (needs root or cached sudo) — this is a best-effort read of sshd_config/Include files, not the effective value. Re-run as root or after 'sudo -v' for a certain answer."
+    ;;
+  *)
+    record ACCESS "SSH key authentication" UNKNOWN "n/a" "Not explicitly set in any scanned file and 'sshd -T' was unavailable. Default is normally 'yes' but this cannot be confirmed here."
+    ;;
+esac
+
+get_ssh_directive "passwordauthentication"
+case "$DIRECTIVE_METHOD" in
+  effective)
+    if [ "$DIRECTIVE_VALUE" = "no" ]; then
+      record ACCESS "Password login" PASS "disabled (sshd -T)" ""
+    else
+      record ACCESS "Password login" WARN "enabled (sshd -T)" "Password login is still enabled. Expected before the kit security procedures run — disable it only AFTER confirming your SSH key works in a second session (see procedures/ssh-hardening.md)."
+    fi
+    ;;
+  fallback)
+    record ACCESS "Password login" WARN "appears '${DIRECTIVE_VALUE}' (file parse only)" "Could not confirm via 'sshd -T'. Treat this as informational only — re-run as root/sudo for certainty."
+    ;;
+  *)
+    record ACCESS "Password login" UNKNOWN "n/a" "Not explicitly set in any scanned file and 'sshd -T' was unavailable — default varies by OpenSSH version, cannot be assumed."
+    ;;
+esac
+
+get_ssh_directive "permitrootlogin"
+case "$DIRECTIVE_METHOD" in
+  effective)
+    case "$DIRECTIVE_VALUE" in
+      no)
+        record ACCESS "Root login" PASS "disabled (sshd -T)" ""
+        ;;
+      prohibit-password|without-password)
+        record ACCESS "Root login" WARN "password blocked, key-based root login still allowed ('$DIRECTIVE_VALUE', sshd -T)" "Safer than 'yes', but the SSH hardening procedure sets this to 'no' entirely — this server hasn't reached that yet, or was changed manually."
+        ;;
+      *)
+        record ACCESS "Root login" WARN "$DIRECTIVE_VALUE (sshd -T)" "Root SSH login is not disabled — the SSH hardening procedure sets this to 'no'."
+        ;;
+    esac
+    ;;
+  fallback)
+    record ACCESS "Root login" WARN "appears '${DIRECTIVE_VALUE}' (file parse only)" "Could not confirm via 'sshd -T'. Treat this as informational only — re-run as root/sudo for certainty."
+    ;;
+  *)
+    record ACCESS "Root login" UNKNOWN "n/a" "Not explicitly set in any scanned file and 'sshd -T' was unavailable — default varies by OpenSSH version (often 'prohibit-password'), cannot be assumed."
+    ;;
+esac
+
+# ================= NETWORK (generic — role-neutral) =================
+
+PUBLIC_IP=""
+if have_cmd curl; then
+  for endpoint in "https://ifconfig.me" "https://icanhazip.com" "https://ipinfo.io/ip"; do
+    PUBLIC_IP="$(curl -fsS --max-time 5 "$endpoint" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$PUBLIC_IP" ]; then
+      break
+    fi
+  done
+fi
+if [ -n "$PUBLIC_IP" ]; then
+  record NETWORK "Public IP" PASS "reachable (address not recorded by the kit)" ""
+else
+  record NETWORK "Public IP" FAIL "n/a" "Could not reach any external IP-lookup service. Check outbound internet / DNS first."
+fi
+
+# IP type (static/dedicated vs shared/NAT) — deliberately never PASS: cannot be proven from inside the VPS.
+INTERNAL_IP=""
+if have_cmd hostname; then
+  INTERNAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+fi
+if [ -n "$PUBLIC_IP" ] && [ -n "$INTERNAL_IP" ]; then
+  if [ "$PUBLIC_IP" = "$INTERNAL_IP" ]; then
+    record NETWORK "IP type" UNKNOWN "internal = public" "The VPS interface IP matches the public IP. This is common but NOT proof of a dedicated/static IP — only your provider's control panel or support can confirm that. Do not treat this as PASS."
+  else
+    record NETWORK "IP type" UNKNOWN "internal != public (NAT likely)" "Internal interface IP differs from public IP, which usually means provider-side NAT/routing. This alone does not tell you whether the public IP is static or shared — confirm with your provider."
+  fi
+else
+  record NETWORK "IP type" UNKNOWN "n/a" "Cannot determine — static/dedicated IP status can only be confirmed by the provider, never reliably from inside the VPS."
+fi
+
+# Generic connectivity target — deliberately NOT an AI-provider domain, so this section stays
+# meaningful for both RU and FOREIGN roles. AI-specific reachability is a separate block below.
+GENERIC_TEST_DOMAIN="cloudflare.com"
+
+DNS_OK=0
+if have_cmd getent; then
+  if getent hosts "$GENERIC_TEST_DOMAIN" >/dev/null 2>&1; then DNS_OK=1; fi
+elif have_cmd nslookup; then
+  if nslookup "$GENERIC_TEST_DOMAIN" >/dev/null 2>&1; then DNS_OK=1; fi
+elif have_cmd dig; then
+  if dig +short "$GENERIC_TEST_DOMAIN" >/dev/null 2>&1; then DNS_OK=1; fi
+fi
+if [ "$DNS_OK" -eq 1 ]; then
+  record NETWORK "DNS resolution" PASS "${GENERIC_TEST_DOMAIN} resolves" ""
+else
+  if have_cmd getent || have_cmd nslookup || have_cmd dig; then
+    record NETWORK "DNS resolution" FAIL "n/a" "DNS lookup for ${GENERIC_TEST_DOMAIN} failed. Check /etc/resolv.conf and provider DNS."
+  else
+    record NETWORK "DNS resolution" UNKNOWN "n/a" "No getent/nslookup/dig available to test DNS."
+  fi
+fi
+
+if have_cmd curl; then
+  HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "https://${GENERIC_TEST_DOMAIN}" 2>/dev/null)"
+  CURL_EXIT=$?
+  if [ "$CURL_EXIT" -eq 0 ] && [ -n "$HTTP_CODE" ]; then
+    record NETWORK "Outbound HTTPS" PASS "TLS handshake OK (HTTP $HTTP_CODE)" ""
+  else
+    record NETWORK "Outbound HTTPS" FAIL "n/a" "curl could not complete an HTTPS request to ${GENERIC_TEST_DOMAIN} (exit code $CURL_EXIT). Check outbound firewall / provider filtering."
+  fi
+else
+  record NETWORK "Outbound HTTPS" UNKNOWN "n/a" "curl not installed — cannot test outbound HTTPS."
+fi
+
+SSHD_ACTIVE="unknown"
+if have_cmd systemctl; then
+  if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+    SSHD_ACTIVE="yes"
+  else
+    SSHD_ACTIVE="no"
+  fi
+elif have_cmd service; then
+  if service ssh status >/dev/null 2>&1 || service sshd status >/dev/null 2>&1; then
+    SSHD_ACTIVE="yes"
+  else
+    SSHD_ACTIVE="no"
+  fi
+fi
+case "$SSHD_ACTIVE" in
+  yes) record NETWORK "SSH service" PASS "active" ""
+       ;;
+  no)  record NETWORK "SSH service" FAIL "not active" "sshd is installed but not running (or not detected as running). Start it before relying on remote access: 'sudo systemctl start ssh'." ;;
+  *)   record NETWORK "SSH service" UNKNOWN "n/a" "Could not query service status (no systemctl/service). Confirm sshd is running manually." ;;
+esac
+
+get_ssh_directive "port"
+case "$DIRECTIVE_METHOD" in
+  effective)
+    SSH_PORT="$DIRECTIVE_VALUE"
+    record NETWORK "SSH configured port" PASS "$SSH_PORT (sshd -T)" ""
+    ;;
+  fallback)
+    SSH_PORT="$DIRECTIVE_VALUE"
+    record NETWORK "SSH configured port" WARN "$SSH_PORT (file parse only)" "Could not run 'sshd -T' (needs root or cached sudo) — determined by parsing sshd_config/Include files instead. This may be wrong if a drop-in file overrides it differently than this parse assumed. Re-run as root or after 'sudo -v' for a certain answer."
+    ;;
+  *)
+    SSH_PORT="22"
+    record NETWORK "SSH configured port" UNKNOWN "assuming 22" "Could not determine the configured port via 'sshd -T' or by parsing config files. Defaulting the display to 22 — this is an assumption, not a confirmed value."
+    ;;
+esac
+
+# ================= AI NETWORK READINESS (FOREIGN role only — reachability only, no auth) =================
+
+if [ "$ROLE" = "FOREIGN" ]; then
+  for _ai_domain in api.anthropic.com claude.ai api.openai.com auth.openai.com; do
+    check_ai_endpoint "$_ai_domain"
+  done
+fi
+
+# ================= SECURITY =================
+
+FIREWALL_TOOL="none"
+UFW_ACTIVE=0
+
+if have_cmd ufw; then
+  FIREWALL_TOOL="ufw"
+  UFW_RAW=""
+  if [ "$IS_ROOT" -eq 1 ]; then
+    UFW_RAW="$(ufw status 2>/dev/null)"
+  elif [ "$SUDO_NONINTERACTIVE" -eq 1 ]; then
+    UFW_RAW="$(sudo -n ufw status 2>/dev/null)"
+  fi
+
+  if [ -n "$UFW_RAW" ]; then
+    if printf '%s' "$UFW_RAW" | head -1 | grep -qi 'active'; then
+      UFW_ACTIVE=1
+      record SECURITY "Firewall (ufw)" PASS "active" ""
+
+      MATCHING_LINES="$(printf '%s\n' "$UFW_RAW" | grep -E "^${SSH_PORT}(/(tcp|udp))?([[:space:]]|\()" || true)"
+      if printf '%s' "$MATCHING_LINES" | grep -qi 'allow'; then
+        if [ "$DIRECTIVE_METHOD" = "effective" ] || [ "$SSHD_METHOD" = "effective" ]; then
+          record SECURITY "Firewall allows SSH port" PASS "$SSH_PORT allowed" ""
+        else
+          record SECURITY "Firewall allows SSH port" WARN "$SSH_PORT appears allowed" "The SSH port itself was only determined via file-parse fallback, not 'sshd -T' — re-verify as root/sudo for certainty that this is really the port in use."
+        fi
+      else
+        record SECURITY "Firewall allows SSH port" FAIL "$SSH_PORT NOT found in ufw allow rules" "ufw is active but does not appear to explicitly allow port $SSH_PORT. This could mean you are about to be, or already are, locked out over SSH. Check 'sudo ufw status numbered' immediately from a still-open session."
+      fi
+    else
+      record SECURITY "Firewall (ufw)" FAIL "inactive" "ufw is installed but not active. This is EXPECTED before the UFW procedure runs — not a pre-bootstrap blocker, but required for the security baseline."
+      record SECURITY "Firewall allows SSH port" UNKNOWN "n/a" "ufw is not active, so no allow-rules apply yet."
+    fi
+  else
+    record SECURITY "Firewall (ufw)" UNKNOWN "n/a" "ufw is installed but its status could not be read without root or cached sudo."
+    record SECURITY "Firewall allows SSH port" UNKNOWN "n/a" "Requires root/sudo to check ufw rules."
+  fi
+elif have_cmd nft; then
+  FIREWALL_TOOL="nftables"
+  if nft list ruleset >/dev/null 2>&1; then
+    RULE_COUNT="$(nft list ruleset 2>/dev/null | grep -c .)"
+    if [ "$RULE_COUNT" -gt 0 ]; then
+      record SECURITY "Firewall (nftables)" WARN "rules present, not verified as ufw-managed" "nftables has rules but this is not the ufw workflow used by the kit — review manually."
+    else
+      record SECURITY "Firewall (nftables)" FAIL "no rules" "nftables is present but empty — no firewall protection active."
+    fi
+  else
+    record SECURITY "Firewall (nftables)" UNKNOWN "n/a" "nft present but ruleset not readable (permissions)."
+  fi
+  record SECURITY "Firewall allows SSH port" UNKNOWN "n/a" "Only checked for ufw setups — the kit procedures use ufw."
+elif have_cmd iptables; then
+  FIREWALL_TOOL="iptables"
+  if iptables -L -n >/dev/null 2>&1; then
+    record SECURITY "Firewall (iptables)" WARN "present, not ufw" "iptables is available but the kit procedures use ufw — review manually or install ufw."
+  else
+    record SECURITY "Firewall (iptables)" UNKNOWN "n/a" "iptables present but not readable without elevated permissions."
+  fi
+  record SECURITY "Firewall allows SSH port" UNKNOWN "n/a" "Only checked for ufw setups — the kit procedures use ufw."
+else
+  record SECURITY "Firewall" UNKNOWN "n/a" "No ufw/nft/iptables found to inspect."
+  record SECURITY "Firewall allows SSH port" UNKNOWN "n/a" "No firewall tool found to inspect."
+fi
+
+if have_cmd ss; then
+  LISTEN_PORTS="$(ss -tln 2>/dev/null | awk 'NR>1 {print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un | tr '\n' ',' | sed 's/,$//')"
+  if [ -n "$LISTEN_PORTS" ]; then
+    record SECURITY "Listening TCP ports" PASS "$LISTEN_PORTS" ""
+  else
+    record SECURITY "Listening TCP ports" UNKNOWN "n/a" "ss returned no parseable LISTEN lines."
+  fi
+elif have_cmd netstat; then
+  LISTEN_PORTS="$(netstat -tln 2>/dev/null | awk '/LISTEN/ {print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un | tr '\n' ',' | sed 's/,$//')"
+  if [ -n "$LISTEN_PORTS" ]; then
+    record SECURITY "Listening TCP ports" PASS "$LISTEN_PORTS" ""
+  else
+    record SECURITY "Listening TCP ports" UNKNOWN "n/a" "netstat returned no parseable LISTEN lines."
+  fi
+else
+  record SECURITY "Listening TCP ports" UNKNOWN "n/a" "Neither ss nor netstat found."
+fi
+
+if have_cmd apt; then
+  UPGRADABLE="$(apt list --upgradable 2>/dev/null | grep -vc '^Listing')"
+  SECURITY_UPGRADABLE="$(apt list --upgradable 2>/dev/null | grep -ic -- '-security' || true)"
+  if [ "${UPGRADABLE:-0}" -gt 0 ] 2>/dev/null; then
+    if [ "${SECURITY_UPGRADABLE:-0}" -gt 0 ] 2>/dev/null; then
+      record SECURITY "Pending updates" WARN "${UPGRADABLE} packages (${SECURITY_UPGRADABLE} security)" "Run 'sudo apt update && sudo apt upgrade' before the next steps (see procedures/ssh-hardening.md)."
+    else
+      record SECURITY "Pending updates" WARN "${UPGRADABLE} packages" "No package list was refreshed recently or none of the upgradable packages are tagged -security; run 'sudo apt update' first to get an accurate picture."
+    fi
+  else
+    record SECURITY "Pending updates" PASS "none pending (or apt cache not refreshed yet)" ""
+  fi
+else
+  record SECURITY "Pending updates" UNKNOWN "n/a" "apt not found — this check only supports Debian/Ubuntu."
+fi
+
+# ================= KIT READINESS (per-check detail) =================
+
+os_supported() {
+  case "$OS_ID" in
+    ubuntu)
+      case "$OS_VERSION" in
+        20.04|22.04|24.04|24.10|25.04|25.10|26.04) return 0 ;;
+        *) return 2 ;;
+      esac
+      ;;
+    debian)
+      case "$OS_VERSION" in
+        10|11|12|13) return 0 ;;
+        *) return 2 ;;
+      esac
+      ;;
+    alpine) return 3 ;;
+    "" | unknown) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+os_supported
+OS_SUPPORT_CODE=$?
+case "$OS_SUPPORT_CODE" in
+  0) record READINESS "OS supported (Ubuntu 20.04+/Debian 10+)" PASS "$OS_NAME" ;;
+  1) record READINESS "OS supported (Ubuntu 20.04+/Debian 10+)" UNKNOWN "n/a" "Could not identify OS — see SYSTEM/OS check above." ;;
+  3) record READINESS "OS supported (Ubuntu 20.04+/Debian 10+)" FAIL "$OS_NAME" "Alpine is musl-based; Claude Code's installer needs extra packages on Alpine, and VS Code Remote-SSH does not officially support musl. Use Ubuntu/Debian instead." ;;
+  *) record READINESS "OS supported (Ubuntu 20.04+/Debian 10+)" WARN "$OS_NAME" "This OS/version is not one of the versions this kit was validated against. It may still work — verify manually." ;;
+esac
+
+case "$ARCH" in
+  x86_64|amd64|aarch64|arm64) record READINESS "Architecture supported" PASS "$ARCH" ;;
+  *) record READINESS "Architecture supported" WARN "$ARCH" "Claude Code / Codex CLI support x64 and ARM64 — this architecture is unconfirmed." ;;
+esac
+
+# Virtualization/hypervisor overhead means a VPS tariff's *nominal* RAM (what the provider bills
+# for) is routinely a few percent higher than what the guest OS reports via /proc/meminfo — this is
+# normal (kernel/hypervisor reservation, not a defect) and is NOT the same thing as an underpowered
+# tariff. Observed and confirmed case: a nominal 4096 MB (4 GB) VPS tariff reports ~3891 MB
+# (3.8 GB) inside Ubuntu — a real ~5% gap. A hard "RAM_MB >= 4096" cutoff misclassifies this as FAIL
+# ("critically insufficient"), which previously led a participant to pay for an unnecessary tariff
+# upgrade. NOMINAL_TOLERANCE_PCT gives nominal-tier tariffs this overhead margin before treating them
+# as genuinely below the tier — 10% comfortably covers the ~5% observed gap plus provider variance.
+NOMINAL_TOLERANCE_PCT=90
+
+if [ "$ROLE" = "FOREIGN" ]; then
+  FOREIGN_MIN_FLOOR=$((4096 * NOMINAL_TOLERANCE_PCT / 100))
+  if [ "$RAM_MB" -ge 8192 ] 2>/dev/null; then
+    record READINESS "RAM meets recommendation (FOREIGN: 8GB+)" PASS "${RAM_GB_DISPLAY:-?} GB"
+  elif [ "$RAM_MB" -ge "$FOREIGN_MIN_FLOOR" ] 2>/dev/null; then
+    record READINESS "RAM meets recommendation (FOREIGN: 8GB+)" WARN "${RAM_GB_DISPLAY:-?} GB" "Meets the 4GB nominal tariff for Claude Code/Codex individually (guest OS commonly reports a few percent less than the billed amount due to virtualization overhead — this is normal, not a fault), but 8GB+ is recommended to run both plus VS Code Server comfortably."
+  elif [ "$RAM_MB" -gt 0 ] 2>/dev/null; then
+    record READINESS "RAM meets recommendation (FOREIGN: 8GB+)" FAIL "${RAM_GB_DISPLAY:-?} GB" "Below even the tolerance floor for the 4GB nominal tariff (expected floor: ~${FOREIGN_MIN_FLOOR} MB after normal virtualization overhead) — critically insufficient to continue setting up this role."
+  else
+    record READINESS "RAM meets recommendation (FOREIGN: 8GB+)" UNKNOWN "n/a" "RAM could not be determined."
+  fi
+else
+  RU_MIN_FLOOR=$((2048 * NOMINAL_TOLERANCE_PCT / 100))
+  if [ "$RAM_MB" -ge "$RU_MIN_FLOOR" ] 2>/dev/null; then
+    record READINESS "RAM sufficient (RU: 2GB+)" PASS "${RAM_GB_DISPLAY:-?} GB"
+  elif [ "$RAM_MB" -ge 512 ] 2>/dev/null; then
+    record READINESS "RAM sufficient (RU: 2GB+)" WARN "${RAM_GB_DISPLAY:-?} GB" "Below the 2GB guideline for the RU role (data storage, no AI agents expected here) but likely still usable."
+  elif [ "$RAM_MB" -gt 0 ] 2>/dev/null; then
+    record READINESS "RAM sufficient (RU: 2GB+)" FAIL "${RAM_GB_DISPLAY:-?} GB" "Critically low RAM for even a lightweight data-storage role — likely to be unstable."
+  else
+    record READINESS "RAM sufficient (RU: 2GB+)" UNKNOWN "n/a" "RAM could not be determined."
+  fi
+fi
+
+HTTPS_OK=0; DNS_OK_FLAG=0
+for i in "${!CHECK_NAME[@]}"; do
+  if [ "${CHECK_NAME[$i]}" = "Outbound HTTPS" ] && [ "${CHECK_STATUS[$i]}" = "PASS" ]; then HTTPS_OK=1; fi
+  if [ "${CHECK_NAME[$i]}" = "DNS resolution" ] && [ "${CHECK_STATUS[$i]}" = "PASS" ]; then DNS_OK_FLAG=1; fi
+done
+if [ "$HTTPS_OK" -eq 1 ] && [ "$DNS_OK_FLAG" -eq 1 ]; then
+  record READINESS "DNS + outbound HTTPS" PASS "working"
+elif [ "$HTTPS_OK" -eq 1 ] || [ "$DNS_OK_FLAG" -eq 1 ]; then
+  record READINESS "DNS + outbound HTTPS" WARN "partial" "One of DNS resolution / outbound HTTPS passed, the other did not — see NETWORK section above."
+else
+  record READINESS "DNS + outbound HTTPS" FAIL "not working" "Neither DNS nor outbound HTTPS could be confirmed — fix this before anything else."
+fi
+
+if [ "$OS_ID" = "alpine" ]; then
+  record READINESS "VS Code Remote-SSH prerequisites" WARN "musl-based OS" "VS Code Server needs glibc; Alpine (musl) is not officially supported by VS Code Remote-SSH. Prefer Ubuntu/Debian."
+elif have_cmd bash; then
+  record READINESS "VS Code Remote-SSH prerequisites" PASS "bash present, glibc-based OS"
+else
+  record READINESS "VS Code Remote-SSH prerequisites" WARN "bash not found" "VS Code Remote-SSH can still work with another shell, but this is unverified for the kit guide."
+fi
+
+record READINESS "Role" PASS "$ROLE"
+
+# ================= TWO-LEVEL READINESS VERDICT =================
+#
+# PRE-BOOTSTRAP READY: safe to continue configuring. Missing firewall/hardening is NOT a blocker
+# here — a brand new VPS is expected to look like this before the kit security procedures run.
+# SECURITY-BASELINE READY: the actual security baseline (key-only SSH, no root login, firewall active and
+# matching the real SSH port) is met.
+
+PRE_BLOCKERS=()
+for i in "${!CHECK_NAME[@]}"; do
+  case "${CHECK_NAME[$i]}" in
+    "SSH service"|"OS supported"*|"Architecture supported"|"RAM meets recommendation"*|"RAM sufficient"*|"DNS + outbound HTTPS")
+      if [ "${CHECK_STATUS[$i]}" = "FAIL" ]; then
+        PRE_BLOCKERS+=("${CHECK_NAME[$i]}: ${CHECK_VALUE[$i]}")
+      fi
+      ;;
+  esac
+done
+
+if [ "${#PRE_BLOCKERS[@]}" -eq 0 ]; then
+  PRE_STATUS="READY"
+else
+  PRE_STATUS="NOT READY"
+fi
+
+BASELINE_BLOCKERS=()
+if [ "$PRE_STATUS" != "READY" ]; then
+  BASELINE_BLOCKERS+=("Pre-bootstrap readiness not met — see blockers above")
+fi
+for i in "${!CHECK_NAME[@]}"; do
+  case "${CHECK_NAME[$i]}" in
+    "SSH key authentication"|"Password login"|"Root login"|"Firewall"*)
+      if [ "${CHECK_STATUS[$i]}" != "PASS" ]; then
+        BASELINE_BLOCKERS+=("${CHECK_NAME[$i]}: ${CHECK_STATUS[$i]} (${CHECK_VALUE[$i]})")
+      fi
+      ;;
+  esac
+done
+
+if [ "${#BASELINE_BLOCKERS[@]}" -eq 0 ]; then
+  BASELINE_STATUS="SECURITY-BASELINE READY"
+else
+  BASELINE_STATUS="SECURITY-BASELINE NOT READY"
+fi
+
+# ================= OUTPUT: human readable =================
+
+TOTAL=0; PASS_COUNT=0; WARN_COUNT=0; FAIL_COUNT=0; UNKNOWN_COUNT=0
+
+echo
+echo "${C_BOLD}VPS SERVER CHECK${C_RESET}"
+echo "Role: ${C_BOLD}${ROLE}${C_RESET}   Server: ${SERVER_NAME}   Provider: ${PROVIDER}   Country: ${COUNTRY}"
+echo
+
+CURRENT_SECTION=""
+for i in "${!CHECK_NAME[@]}"; do
+  SECTION="${CHECK_SECTION[$i]}"
+  NAME="${CHECK_NAME[$i]}"
+  STATUS="${CHECK_STATUS[$i]}"
+  VALUE="${CHECK_VALUE[$i]}"
+  DETAIL="${CHECK_DETAIL[$i]}"
+
+  if [ "$SECTION" != "$CURRENT_SECTION" ]; then
+    echo
+    echo "${C_BOLD}${SECTION}${C_RESET}"
+    CURRENT_SECTION="$SECTION"
+  fi
+
+  PADDED_NAME="$(printf '%-32s' "$NAME" | tr ' ' '.')"
+  printf '%s %s %s\n' "$PADDED_NAME" "$(status_symbol "$STATUS")" "$VALUE"
+  if [ -n "$DETAIL" ] && [ "$STATUS" != "PASS" ]; then
+    printf '    -> %s\n' "$DETAIL"
+  fi
+
+  TOTAL=$((TOTAL + 1))
+  case "$STATUS" in
+    PASS) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+    WARN) WARN_COUNT=$((WARN_COUNT + 1)) ;;
+    FAIL) FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+    *)    UNKNOWN_COUNT=$((UNKNOWN_COUNT + 1)) ;;
+  esac
+done
+
+echo
+echo "${C_BOLD}CHECK COUNTS${C_RESET}"
+echo "${PASS_COUNT}/${TOTAL} PASSED   ${WARN_COUNT} warning(s)   ${FAIL_COUNT} failed   ${UNKNOWN_COUNT} unknown"
+echo
+
+echo "${C_BOLD}READINESS${C_RESET}"
+if [ "$PRE_STATUS" = "READY" ]; then
+  echo "${C_PASS}${C_BOLD}PRE-BOOTSTRAP: READY${C_RESET} — safe to continue with the kit security procedures."
+else
+  echo "${C_FAIL}${C_BOLD}PRE-BOOTSTRAP: NOT READY${C_RESET} — fix these before continuing:"
+  for b in "${PRE_BLOCKERS[@]}"; do echo "    - $b"; done
+fi
+echo
+if [ "$BASELINE_STATUS" = "SECURITY-BASELINE READY" ]; then
+  echo "${C_PASS}${C_BOLD}SECURITY-BASELINE READY${C_RESET}"
+else
+  echo "${C_WARN}${C_BOLD}SECURITY-BASELINE NOT READY${C_RESET} — outstanding:"
+  for b in "${BASELINE_BLOCKERS[@]}"; do echo "    - $b"; done
+fi
+echo
+
+# ================= OUTPUT: JSON =================
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' '
+}
+
+json_array_of_strings() {
+  local first=1 s
+  printf '['
+  for s in "$@"; do
+    if [ "$first" -eq 1 ]; then first=0; else printf ', '; fi
+    printf '"%s"' "$(json_escape "$s")"
+  done
+  printf ']'
+}
+
+{
+  printf '{\n'
+  printf '  "server_name": "%s",\n' "$(json_escape "$SERVER_NAME")"
+  printf '  "role": "%s",\n' "$(json_escape "$ROLE")"
+  printf '  "provider": "%s",\n' "$(json_escape "$PROVIDER")"
+  printf '  "country": "%s",\n' "$(json_escape "$COUNTRY")"
+  printf '  "public_ip": "%s",\n' "$([ -n "$PUBLIC_IP" ] && echo hidden || echo UNKNOWN)"
+  printf '  "os": {"id": "%s", "name": "%s", "version": "%s"},\n' \
+    "$(json_escape "$OS_ID")" "$(json_escape "$OS_NAME")" "$(json_escape "$OS_VERSION")"
+  printf '  "architecture": "%s",\n' "$(json_escape "$ARCH")"
+  printf '  "cpu": {"vcpu": %s},\n' "${CPU_COUNT:-0}"
+  printf '  "ram": {"mb": %s},\n' "${RAM_MB:-0}"
+  printf '  "disk": {"total_gb": %s, "free_gb": %s},\n' "${DISK_TOTAL_GB:-0}" "${DISK_FREE_GB:-0}"
+  printf '  "ssh": {"service_active": "%s", "port": "%s", "config_method": "%s"},\n' \
+    "$(json_escape "$SSHD_ACTIVE")" "$(json_escape "$SSH_PORT")" "$(json_escape "$SSHD_METHOD")"
+  printf '  "checks": [\n'
+  for i in "${!CHECK_NAME[@]}"; do
+    printf '    {"section": "%s", "name": "%s", "status": "%s", "value": "%s", "detail": "%s"}%s\n' \
+      "$(json_escape "${CHECK_SECTION[$i]}")" \
+      "$(json_escape "${CHECK_NAME[$i]}")" \
+      "$(json_escape "${CHECK_STATUS[$i]}")" \
+      "$(json_escape "${CHECK_VALUE[$i]}")" \
+      "$(json_escape "${CHECK_DETAIL[$i]}")" \
+      "$([ "$i" -lt $((${#CHECK_NAME[@]} - 1)) ] && echo ',' || echo '')"
+  done
+  printf '  ],\n'
+  printf '  "readiness": {\n'
+  printf '    "pre_bootstrap": {"status": "%s", "blockers": %s},\n' "$PRE_STATUS" "$(json_array_of_strings "${PRE_BLOCKERS[@]}")"
+  printf '    "baseline": {"status": "%s", "blockers": %s},\n' "$BASELINE_STATUS" "$(json_array_of_strings "${BASELINE_BLOCKERS[@]}")"
+  printf '    "passed": %s, "warnings": %s, "failed": %s, "unknown": %s, "total": %s\n' \
+    "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT" "$UNKNOWN_COUNT" "$TOTAL"
+  printf '  },\n'
+  printf '  "tool_version": "%s",\n' "$SCRIPT_VERSION"
+  printf '  "timestamp": "%s"\n' "$TIMESTAMP"
+  printf '}\n'
+} > "$JSON_PATH" 2>/dev/null && echo "Machine-readable report written to: $JSON_PATH" || echo "WARNING: could not write JSON report to $JSON_PATH" >&2
+
+if [ "$PRE_STATUS" != "READY" ]; then
+  exit 1
+fi
+exit 0

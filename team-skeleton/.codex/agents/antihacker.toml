@@ -1,0 +1,3 @@
+name = "antihacker"
+description = "Generic antihacker role of the base neuro-team skeleton (see team/antihacker/instructions.md)."
+developer_instructions = "Before acting, read team/antihacker/instructions.md completely and the closest project rules (AGENTS.md). Stay inside this role, report results with evidence and return them to the invoking pm or orchestrator. This adapter file only exposes the role: it does not prove the role was invoked."

@@ -1,0 +1,5 @@
+{
+  "network_send": false,
+  "local_events": true,
+  "note": "Network sending is off by default and the kit contains no sending code."
+}

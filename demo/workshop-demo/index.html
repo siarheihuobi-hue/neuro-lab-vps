@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Моя нейрокоманда</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="app__header">
+      <h1>Моя нейрокоманда</h1>
+      <p class="app__subtitle">Задачи команды. Список хранится в этом браузере.</p>
+    </header>
+
+    <form class="add-form" id="add-form" autocomplete="off">
+      <label class="visually-hidden" for="task-input">Новая задача</label>
+      <input id="task-input" class="add-form__input" type="text" maxlength="200"
+             placeholder="Например: Copywriter — написать анонс" required>
+      <button class="btn btn--primary" type="submit">Добавить</button>
+    </form>
+    <p class="form-error" id="form-error" role="alert" hidden>Введите текст задачи.</p>
+
+    <p class="counter" id="counter" aria-live="polite"></p>
+
+    <ul class="task-list" id="task-list"></ul>
+
+    <p class="empty" id="empty-state" hidden>Задач пока нет. Добавьте первую выше.</p>
+
+    <footer class="app__footer">
+      <button class="btn btn--ghost" type="button" id="clear-done" hidden>Удалить выполненные</button>
+    </footer>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

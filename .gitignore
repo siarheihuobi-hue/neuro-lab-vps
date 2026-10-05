@@ -1,0 +1,17 @@
+# Participant state, diagnostics, telemetry and local data never enter Git or the ZIP.
+state/
+diagnostics/
+*.log
+
+# Secrets and authorization.
+.env
+.env.*
+*.pem
+*.key
+id_*
+known_hosts
+known_hosts.*
+*.token
+
+# Local server-check reports.
+vps-preflight-report*.json
