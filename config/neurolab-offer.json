@@ -1,0 +1,8 @@
+{
+  "_note": "Настройка предложения Neuro-lab. Пока cta_enabled равно false или cta_url пуст, ссылка и кнопка скрыты. Адрес должен быть https, тарифы и условия вписывает владелец; агент ничего не придумывает.",
+  "cta_enabled": false,
+  "cta_url": "",
+  "cta_label": "Посмотреть резидентство Neuro-lab",
+  "offer_summary": "",
+  "terms_summary": ""
+}

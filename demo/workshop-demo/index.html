@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="demo-version" content="2">
   <title>Моя нейрокоманда</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -12,6 +13,48 @@
       <h1>Моя нейрокоманда</h1>
       <p class="app__subtitle">Задачи команды. Список хранится в этом браузере.</p>
     </header>
+
+    <section class="done" id="check-done" aria-labelledby="done-title" hidden>
+      <h2 id="done-title" tabindex="-1">Поздравляем! Тестовое приложение работает 🎉</h2>
+      <p>Вы завершили практическую проверку приложения на сервере.</p>
+      <p>Следующий шаг — научиться пользоваться рабочей средой: открывать проекты, ставить задачи нейрокоманде и продолжать работу после отключения.</p>
+      <div class="done__actions">
+        <button class="btn btn--primary" type="button" id="go-gpt" aria-expanded="false" aria-controls="panel-gpt">Продолжить с GPT-проводником</button>
+        <button class="btn btn--primary" type="button" id="go-vscode" aria-expanded="false" aria-controls="panel-vscode">Продолжить с нейрокомандой в VS Code</button>
+      </div>
+      <div class="done__panel" id="panel-gpt" hidden>
+        <p class="done__where"><strong>Куда вставить:</strong> в чат с GPT-проводником — тот же, где вы начинали, или новый чат, начатый с промпта из файла ENTRY.md комплекта (раздел А). Страница сама ничего не отправит и не переключит вас в чат.</p>
+        <label class="visually-hidden" for="msg-gpt">Готовое сообщение для GPT-проводника</label>
+        <textarea class="done__msg" id="msg-gpt" rows="5" readonly></textarea>
+        <button class="btn btn--ghost" type="button" data-copy="msg-gpt">Скопировать сообщение</button>
+        <span class="done__copied" data-copied-for="msg-gpt" role="status" aria-live="polite"></span>
+      </div>
+      <div class="done__panel" id="panel-vscode" hidden>
+        <p class="done__where"><strong>Куда вставить:</strong> в панель Claude или Codex в окне VS Code, открытом на папке комплекта (удалённое окно). Страница сама не откроет VS Code и ничего не отправит.</p>
+        <label class="visually-hidden" for="msg-vscode">Готовое сообщение для нейрокоманды в VS Code</label>
+        <textarea class="done__msg" id="msg-vscode" rows="5" readonly></textarea>
+        <button class="btn btn--ghost" type="button" data-copy="msg-vscode">Скопировать сообщение</button>
+        <span class="done__copied" data-copied-for="msg-vscode" role="status" aria-live="polite"></span>
+      </div>
+      <p class="done__limits">Это завершение проверки приложения в браузере. Оно не подтверждает настройку сервера, безопасность, файрвол, переподключение или завершение всего маршрута: это сверит нейрокоманда по сохранённому состоянию, а открытые пункты безопасности она покажет отдельно.</p>
+      <button class="btn btn--ghost" type="button" id="done-retry">Повторить проверку</button>
+    </section>
+
+    <section class="check" id="check" aria-labelledby="check-title">
+      <h2 id="check-title">Практическая проверка приложения</h2>
+      <ol class="check__steps" id="check-steps">
+        <li data-step="add"><span class="check__mark" aria-hidden="true"></span><span class="check__label">Добавить две новые задачи</span><span class="visually-hidden check__state"></span></li>
+        <li data-step="mark"><span class="check__mark" aria-hidden="true"></span><span class="check__label">Отметить одну из них выполненной</span><span class="visually-hidden check__state"></span></li>
+        <li data-step="reload"><span class="check__mark" aria-hidden="true"></span><span class="check__label">Обновить страницу: задачи и отметка сохранились</span><span class="visually-hidden check__state"></span></li>
+        <li data-step="delete"><span class="check__mark" aria-hidden="true"></span><span class="check__label">Удалить выполненную задачу, оставив вторую</span><span class="visually-hidden check__state"></span></li>
+      </ol>
+      <p class="check__hint" id="check-hint" role="status" aria-live="polite"></p>
+      <div class="check__actions">
+        <button class="btn btn--primary" type="button" id="check-start">Начать проверку</button>
+        <button class="btn btn--ghost" type="button" id="check-retry" hidden>Повторить проверку</button>
+        <button class="btn btn--ghost" type="button" id="check-cancel" hidden>Отменить проверку</button>
+      </div>
+    </section>
 
     <form class="add-form" id="add-form" autocomplete="off">
       <label class="visually-hidden" for="task-input">Новая задача</label>

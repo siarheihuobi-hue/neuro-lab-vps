@@ -1,5 +1,6 @@
 # Participant state, diagnostics, telemetry and local data never enter Git or the ZIP.
 state/
+.upgrade-backups/
 diagnostics/
 *.log
 

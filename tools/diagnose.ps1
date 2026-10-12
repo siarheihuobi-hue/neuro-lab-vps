@@ -1,6 +1,6 @@
 <#
  diagnose.ps1 - read-only start diagnostics for the VPS workshop kit (Windows branch).
- Kit 0.1.2-preview.
+ Kit 0.2.0-preview.
  ASCII only on purpose: Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI.
  It never changes the system, network, VPN, SSH, keys or settings. It writes only under <kit>\state\.
 
@@ -11,10 +11,11 @@
    powershell -NoProfile -File tools\diagnose.ps1 -Reset 4
    powershell -NoProfile -File tools\diagnose.ps1 -Claim 4 -Source project-status   (a claim from existing project documents: NOT a PASS)
    powershell -NoProfile -File tools\diagnose.ps1 -Report      (safe summary to paste into a problem report)
+   powershell -NoProfile -File tools\diagnose.ps1 -Fact KEY_LOGIN=PASS -Source agent-whoami -Evidence L   (one finer fact; see tools\README.md)
+   powershell -NoProfile -File tools\diagnose.ps1 -NewServer -Source owner-message   (a NEW server: new generation, old server facts do not carry over)
+   powershell -NoProfile -File tools\diagnose.ps1 -Migrate    (idempotent state migration to schema 2; also done on a normal run)
+   powershell -NoProfile -File tools\diagnose.ps1 -Summary    (five separate results: workspace, app, reconnect, security, training)
 
- Test-only environment hooks (never needed by participants):
-   KIT_PROBE_NO_FALLBACK=1  disable the install-location fallbacks for code/ssh
-   KIT_PROBE_HIDE=code,ssh    pretend the named tools are not installed
 #>
 [CmdletBinding()]
 param(
@@ -25,11 +26,15 @@ param(
   [string]$Note = '',
   [int]$Reset = 0,
   [int]$Claim = 0,
+  [string[]]$Fact = @(),
+  [switch]$NewServer,
+  [switch]$Migrate,
+  [switch]$Summary,
   [switch]$Report
 )
 
 $ErrorActionPreference = 'Continue'
-$KitVersion = '0.1.2-preview'
+$KitVersion = '0.2.0-preview'
 $KitRoot  = Split-Path -Parent $PSScriptRoot
 $StateDir = Join-Path $KitRoot 'state'
 $TelDir   = Join-Path $StateDir 'telemetry'
@@ -37,6 +42,10 @@ $FDiag    = Join-Path $StateDir 'diagnostics.tsv'
 $FStages  = Join-Path $StateDir 'stages.tsv'
 $FAnswers = Join-Path $StateDir 'answers.tsv'
 $FEvents  = Join-Path $TelDir 'events.jsonl'
+$FMeta    = Join-Path $StateDir 'meta.tsv'
+$FFacts   = Join-Path $StateDir 'facts.tsv'
+$FHist    = Join-Path $StateDir 'history.tsv'
+$FOffer   = Join-Path $KitRoot 'config\neurolab-offer.json'
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $Tab = "`t"
 $StageCount = 12
@@ -95,8 +104,23 @@ $AllowedAnswers = @{
   'workspace_selected'  = @('yes', 'no');
   'map_ready'           = @('yes', 'no');
   'project_link'        = @('parent', 'standalone');
-  'neurolab_offer'      = @('shown', 'declined', 'interested')
+  'neurolab_offer'      = @('shown', 'declined', 'interested', 'already_member');
+  'neurolab_member'     = @('yes', 'no', 'unknown');
+  'entry_mode'          = @('gpt_guide', 'vscode_direct');
+  'server_state'        = @('none', 'existing_active', 'replaced', 'unknown');
+  'purchase_profile'    = @('base', 'recommended', 'existing', 'undecided');
+  'engine_mode'         = @('claude_only', 'codex_only', 'both', 'undecided');
+  'exec_place'          = @('laptop_windows', 'laptop_macos', 'remote_linux', 'local_linux', 'wsl', 'unknown');
+  'account_state'       = @('new', 'existing', 'unknown');
+  'region_state'        = @('available', 'unavailable', 'unknown');
+  'panel_access'        = @('ok', 'unreachable_via_vpn', 'other');
+  'cheat_sheet_local'   = @('yes', 'no');
+  'admin_sudo_actor'    = @('working_ssh_user', 'other_account', 'untested');
+  'admin_sudo_result'   = @('ok', 'auth_failed', 'no_sudo_rights', 'no_interactive_input', 'agent_context_unavailable', 'other', 'untested');
+  'admin_candidate'     = @('none', 'current_user_in_sudo_group', 'other_account_in_sudo_group', 'unknown');
+  'admin_context'       = @('human_terminal', 'agent_channel', 'none')
 }
+$ServerAnswers = @('server_state', 'purchase_profile', 'region_state', 'panel_access', 'account_state', 'admin_sudo_actor', 'admin_sudo_result', 'admin_candidate', 'admin_context')
 function Load-Answers {
   $h = @{}
   foreach ($l in (Read-Lines $FAnswers)) {
@@ -111,25 +135,116 @@ function Save-Answers($h) {
   Write-Lines $FAnswers $out
 }
 
+
+# ---------- state schema 2: finer facts, server generation ----------
+# facts.tsv: fact, status, label, source, date, generation.  meta.tsv: schema, target_id, generation, created, migrated_from.
+$FactNames = @('SERVER_PURCHASED', 'SERVER_ACTIVE', 'HOST_IDENTITY', 'KEY_READY', 'KEY_INSTALLED', 'KEY_LOGIN', 'PREFLIGHT', 'ADMIN_READY', 'UFW', 'SSH_HARDENING',
+               'ENGINE_READY', 'TEAM_LOADED', 'QA', 'APP_BROWSER', 'RECONNECT',
+               'TRAIN_REMOTE_WINDOW', 'TRAIN_OPEN_PROJECT', 'TRAIN_NEW_PROJECT', 'TRAIN_SESSION', 'TRAIN_TASK', 'TRAIN_PORTS', 'TRAIN_DISK', 'TRAIN_RESUME', 'TRAINING')
+$TrainNames = @('TRAIN_REMOTE_WINDOW', 'TRAIN_OPEN_PROJECT', 'TRAIN_NEW_PROJECT', 'TRAIN_SESSION', 'TRAIN_TASK', 'TRAIN_PORTS', 'TRAIN_DISK', 'TRAIN_RESUME')
+$FactStatuses = @('PASS', 'OPEN', 'BLOCKED', 'NOT_RUN', 'UNVERIFIED', 'ACCEPTED_RISK', 'SKIPPED')
+$LocalEvidenceFacts = @('KEY_LOGIN', 'ADMIN_READY', 'UFW', 'SSH_HARDENING')
+$StageNeeds = @{
+  3 = @('SERVER_PURCHASED', 'SERVER_ACTIVE'); 4 = @('HOST_IDENTITY', 'KEY_READY', 'KEY_INSTALLED', 'KEY_LOGIN'); 5 = @('PREFLIGHT');
+  6 = @('ADMIN_READY', 'UFW', 'SSH_HARDENING'); 7 = @('ENGINE_READY'); 9 = @('TEAM_LOADED'); 10 = @('QA'); 11 = @('APP_BROWSER'); 12 = @('RECONNECT')
+}
+$StageToFacts = $StageNeeds
+function Load-Facts {
+  $h = @{}
+  foreach ($l in (Read-Lines $FFacts)) {
+    if ($l.Trim().Length -eq 0) { continue }
+    $p = $l -split "`t"
+    if ($p.Count -ge 6) { $h[$p[0]] = $p }
+  }
+  return $h
+}
+function Save-Facts($h) {
+  $out = @()
+  foreach ($k in $FactNames) { if ($h.ContainsKey($k)) { $out += ($h[$k] -join $Tab) } }
+  Write-Lines $FFacts $out
+}
+function Fact-Status($h, [string]$n) {
+  if ($h.ContainsKey($n)) { return $h[$n][1] }
+  return 'NOT_RUN'
+}
+function Fact-Ok($h, [string]$n) {
+  $s = Fact-Status $h $n
+  if ($s -eq 'PASS') { return $true }
+  if ($n -eq 'HOST_IDENTITY' -and $s -eq 'ACCEPTED_RISK') { return $true }
+  return $false
+}
+function Load-Meta {
+  $h = @{}
+  foreach ($l in (Read-Lines $FMeta)) { $p = $l -split "`t"; if ($p.Count -ge 2) { $h[$p[0]] = $p[1] } }
+  return $h
+}
+function Save-Meta($h) {
+  $out = @()
+  foreach ($k in @('schema', 'target_id', 'generation', 'created', 'migrated_from')) { if ($h.ContainsKey($k)) { $out += ($k + $Tab + $h[$k]) } }
+  Write-Lines $FMeta $out
+}
+function New-TargetId { return ([guid]::NewGuid().ToString('N')).Substring(0, 8) }
+# Creates meta.tsv when absent. Old (schema 1) state is backed up and its PASS stages are mapped to facts. Idempotent.
+function Ensure-Meta {
+  if (Test-Path -LiteralPath $FMeta) { return $false }
+  $had = Test-Path -LiteralPath $FStages
+  $m = @{ schema = '2'; target_id = (New-TargetId); generation = '1'; created = (NowUtc); migrated_from = 'none' }
+  if ($had) {
+    $m['migrated_from'] = 'schema1'
+    $bk = Join-Path $StateDir 'backup-schema1'
+    if (-not (Test-Path -LiteralPath $bk)) { New-Item -ItemType Directory -Path $bk -Force | Out-Null }
+    foreach ($f in @($FStages, $FAnswers)) { if (Test-Path -LiteralPath $f) { Copy-Item -LiteralPath $f -Destination $bk -Force } }
+    $st = Load-Stages
+    $facts = Load-Facts
+    foreach ($n in $StageToFacts.Keys) {
+      if ($st[[int]$n][1] -eq 'PASS') {
+        foreach ($fn in $StageToFacts[$n]) {
+          if (($LocalEvidenceFacts -contains $fn) -and ($st[[int]$n][2] -notmatch 'L')) { continue }   # a person's word alone is not carried over as a security fact
+          if (-not $facts.ContainsKey($fn)) { $facts[$fn] = @($fn, 'PASS', $st[[int]$n][2], 'migrated', (NowUtc), '1') }
+        }
+      }
+    }
+    Save-Facts $facts
+  }
+  Save-Meta $m
+  return $true
+}
+function Is-Persistent([string]$n) { return (($n -eq 'KEY_READY') -or ($TrainNames -contains $n) -or ($n -eq 'TRAINING')) }
+
+function Offer-Config {
+  $r = @{ Ready = $false; Reason = 'config_missing' }
+  if (-not (Test-Path -LiteralPath $FOffer)) { return $r }
+  try {
+    $j = [System.IO.File]::ReadAllText($FOffer, $Utf8) | ConvertFrom-Json
+    if ($j.cta_enabled -ne $true) { $r.Reason = 'cta_disabled'; return $r }
+    if (-not ($j.cta_url -match '^https:[/][/][A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$')) { $r.Reason = 'cta_url_missing_or_not_https'; return $r }
+    if (-not $j.cta_label) { $r.Reason = 'cta_label_missing'; return $r }
+    $r.Ready = $true; $r.Reason = 'ok'
+  } catch { $r.Reason = 'config_unreadable' }
+  return $r
+}
+
 # ---------- probes ----------
 function Get-Fallbacks([string]$name) {
   $r = @()
   if ($name -eq 'code') {
-    if ($env:LOCALAPPDATA) { $r += (Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code\bin\code.cmd') }
-    if ($env:ProgramFiles) { $r += (Join-Path $env:ProgramFiles 'Microsoft VS Code\bin\code.cmd') }
+    $la = [Environment]::GetFolderPath('LocalApplicationData')
+    if ($la) { $r += (Join-Path $la 'Programs\Microsoft VS Code\bin\code.cmd') }
+    $pf = [Environment]::GetFolderPath('ProgramFiles')
+    if ($pf) { $r += (Join-Path $pf 'Microsoft VS Code\bin\code.cmd') }
   }
   if ($name -eq 'ssh') {
-    if ($env:SystemRoot) { $r += (Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe') }
+    $sysd = [Environment]::GetFolderPath('System')
+    if ($sysd) { $r += (Join-Path $sysd 'OpenSSH\ssh.exe') }
   }
   return $r
 }
 function Probe([string]$name, [string[]]$arguments) {
   $res = @{ Status = 'NOT_FOUND'; Lines = @() }
-  if ($env:KIT_PROBE_HIDE -and (($env:KIT_PROBE_HIDE -split ",") -contains $name)) { return $res }
   $path = $null
   $cmd = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($cmd -and $cmd.Source) { $path = $cmd.Source }
-  elseif (-not $env:KIT_PROBE_NO_FALLBACK) {
+  else {
     foreach ($c in (Get-Fallbacks $name)) { if (Test-Path -LiteralPath $c) { $path = $c; break } }
   }
   if (-not $path) { return $res }
@@ -174,6 +289,9 @@ function Get-Status([string]$id) {
 }
 
 # ---------- subcommands that do not run diagnostics ----------
+foreach ($tok in @($Source, $Note)) {
+  if ($tok -match '(^|[^0-9])[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}($|[^0-9])') { Fail 'source and note must not look like an IP address' 2 }
+}
 $ctl = $false
 if ($Answer.Count -gt 0) {
   $ctl = $true
@@ -196,6 +314,13 @@ if ($Accept -ne 0) {
   if ($Source -notmatch '^[A-Za-z0-9_.+-]{1,40}$') { Fail 'PASS needs -Source (evidence source, 1-40 chars of A-Za-z0-9_.+-)' 2 }
   if (@('L', 'U', 'LU') -notcontains $Evidence) { Fail 'PASS needs -Evidence L (checked locally), U (reported by the person) or LU' 2 }
   if ($Note -and $Note -notmatch '^[A-Za-z0-9_.+-]{0,40}$') { Fail 'note must match A-Za-z0-9_.+- (no free text, no secrets)' 2 }
+  [void](Ensure-Meta)
+  if ($StageNeeds.ContainsKey([int]$Accept)) {
+    $facts = Load-Facts
+    $miss = @()
+    foreach ($fn in $StageNeeds[[int]$Accept]) { if (-not (Fact-Ok $facts $fn)) { $miss += $fn } }
+    if ($miss.Count -gt 0) { Fail ('ACCEPT_NEEDS_FACTS stage=' + $Accept + ' missing=' + ($miss -join ',') + ' (record each fact with -Fact NAME=PASS -Source ... -Evidence ...)') 2 }
+  }
   $st = Load-Stages
   $noteVal = 'accepted'; if ($Note) { $noteVal = $Note }
   Set-Stage $st $Accept 'PASS' $Evidence $Source $noteVal
@@ -216,6 +341,74 @@ if ($Claim -ne 0) {
     Write-Host ('STAGE_CLAIMED ' + $Claim + ' (not a PASS: verify it, then -Accept)')
   }
 }
+
+if ($Fact.Count -gt 0) {
+  $ctl = $true
+  if ($Source -notmatch '^[A-Za-z0-9_.+-]{1,40}$') { Fail 'a fact needs -Source (evidence source, 1-40 chars of A-Za-z0-9_.+-)' 2 }
+  $ev = $Evidence; if (-not $ev) { $ev = '?' }
+  if (@('L', 'U', 'LU', '?') -notcontains $ev) { Fail 'evidence must be L, U, LU or ?' 2 }
+  [void](Ensure-Meta)
+  $gen = (Load-Meta)['generation']
+  $facts = Load-Facts
+  $todo = @()
+  foreach ($f in $Fact) {
+    $i = $f.IndexOf('=')
+    if ($i -lt 1) { Fail 'fact must be NAME=STATUS' 2 }
+    $name = $f.Substring(0, $i).Trim().ToUpper()
+    $stt = $f.Substring($i + 1).Trim().ToUpper()
+    if ($FactNames -notcontains $name) { Fail ('fact not allowed: ' + $name) 2 }
+    if ($FactStatuses -notcontains $stt) { Fail ('fact status not allowed: ' + $stt) 2 }
+    if ($name -eq 'TRAINING' -and $stt -eq 'PASS') { Fail 'TRAINING_IS_COMPUTED: training is complete only when all TRAIN_* facts are PASS; a skip is recorded as TRAINING=SKIPPED' 2 }
+    if (($stt -eq 'ACCEPTED_RISK' -or $stt -eq 'UNVERIFIED') -and $name -ne 'HOST_IDENTITY') { Fail ($stt + ' is allowed only for HOST_IDENTITY') 2 }
+    if ($stt -eq 'SKIPPED' -and -not (($TrainNames -contains $name) -or $name -eq 'TRAINING')) { Fail 'SKIPPED is allowed only for TRAIN_* and TRAINING' 2 }
+    if ($stt -eq 'PASS') {
+      if ($ev -eq '?') { Fail 'PASS needs -Evidence L, U or LU' 2 }
+      if (($LocalEvidenceFacts -contains $name) -and ($ev -eq 'U')) { Fail ($name + ' PASS needs evidence that includes L: a statement of the person alone is not enough') 2 }
+      if ($name -eq 'HOST_IDENTITY' -and $ev -eq 'L') { Fail 'HOST_IDENTITY PASS needs the person to confirm the independent comparison (evidence U or LU)' 2 }
+    }
+    if ($stt -eq 'ACCEPTED_RISK' -and $ev -ne 'U') { Fail 'ACCEPTED_RISK is the owner decision: evidence U' 2 }
+    if ($name -eq 'ADMIN_READY' -and $stt -eq 'PASS') {
+      $aa = Load-Answers
+      if (($aa['admin_context'] -ne 'agent_channel') -or ($aa['admin_sudo_result'] -ne 'ok')) { Fail 'ADMIN_READY PASS needs the answers admin_context=agent_channel and admin_sudo_result=ok, recorded from a real administrative command in the agent channel' 2 }
+    }
+    $todo += ,@($name, $stt)
+  }
+  foreach ($t in $todo) { $facts[$t[0]] = @($t[0], $t[1], $ev, $Source, (NowUtc), $gen) }
+  Save-Facts $facts
+  foreach ($t in $todo) { Write-Host ('FACT_SET ' + $t[0] + ' ' + $t[1]) }
+}
+if ($NewServer) {
+  $ctl = $true
+  if ($Source -notmatch '^[A-Za-z0-9_.+-]{1,40}$') { Fail 'a new server needs -Source (why, 1-40 chars of A-Za-z0-9_.+-)' 2 }
+  [void](Ensure-Meta)
+  $m = Load-Meta
+  $oldGen = [int]$m['generation']
+  $oldTid = $m['target_id']
+  $m['generation'] = [string]($oldGen + 1)
+  $m['target_id'] = (New-TargetId)
+  Save-Meta $m
+  $facts = Load-Facts
+  $kept = @{}
+  $retired = 0
+  foreach ($k in @($facts.Keys)) {
+    if (Is-Persistent $k) { $kept[$k] = $facts[$k] }
+    else { $retired++; Append-Line $FHist ('fact_retired' + $Tab + $oldGen + $Tab + $oldTid + $Tab + $k + $Tab + $facts[$k][1] + $Tab + (NowUtc)) }
+  }
+  Save-Facts $kept
+  Append-Line $FHist ('generation_retired' + $Tab + $oldGen + $Tab + $oldTid + $Tab + $Source + $Tab + '-' + $Tab + (NowUtc))
+  $st = Load-Stages
+  for ($i = 3; $i -le $StageCount; $i++) { Set-Stage $st $i 'PENDING' '?' 'new_server' ('generation_' + $m['generation']) }
+  Save-Stages $st
+  $ans = Load-Answers
+  foreach ($k in $ServerAnswers) { if ($ans.ContainsKey($k)) { $ans.Remove($k) } }
+  Save-Answers $ans
+  Write-Host ('NEW_SERVER generation=' + $m['generation'] + ' retired_facts=' + $retired + ' stages_reset=3..' + $StageCount + ' kept=stages_1_2,interview,map,key_ready,training')
+}
+if ($Migrate) {
+  $ctl = $true
+  $did = Ensure-Meta
+  if ($did) { Write-Host 'STATE_MIGRATED schema=2' } else { Write-Host 'STATE_ALREADY_CURRENT schema=2' }
+}
 if ($Reset -ne 0) {
   $ctl = $true
   if ($Reset -lt 1 -or $Reset -gt $StageCount) { Fail "stage must be 1..$StageCount" 2 }
@@ -226,12 +419,62 @@ if ($Reset -ne 0) {
 }
 if ($ctl) { exit 0 }
 
+
+# ---------- summary: five separate results, never one general PASS from partial facts ----------
+if ($Summary) {
+  [void](Ensure-Meta)
+  $st = Load-Stages
+  $facts = Load-Facts
+  $ans = Load-Answers
+  $ws = @(); if ($st[5][1] -ne 'PASS') { $ws += 'STAGE_5' }; if ($st[7][1] -ne 'PASS') { $ws += 'STAGE_7' }
+  foreach ($n in @('KEY_LOGIN', 'ENGINE_READY')) { if (-not (Fact-Ok $facts $n)) { $ws += $n } }
+  $app = @(); if ($st[11][1] -ne 'PASS') { $app += 'STAGE_11' }; if (-not (Fact-Ok $facts 'APP_BROWSER')) { $app += 'APP_BROWSER' }
+  $rec = @(); if ($st[12][1] -ne 'PASS') { $rec += 'STAGE_12' }; if (-not (Fact-Ok $facts 'RECONNECT')) { $rec += 'RECONNECT' }
+  $sec = @(); if ($st[6][1] -ne 'PASS') { $sec += 'STAGE_6' }; foreach ($n in @('ADMIN_READY', 'UFW', 'SSH_HARDENING')) { if (-not (Fact-Ok $facts $n)) { $sec += $n } }
+  $trPass = 0; foreach ($n in $TrainNames) { if ((Fact-Status $facts $n) -eq 'PASS') { $trPass++ } }
+  $trSkipped = ((Fact-Status $facts 'TRAINING') -eq 'SKIPPED')
+  $wsOk = ($ws.Count -eq 0); $appOk = ($app.Count -eq 0); $recOk = ($rec.Count -eq 0); $secOk = ($sec.Count -eq 0)
+  $trOk = ($trPass -eq $TrainNames.Count)
+  if ($wsOk) { Write-Host 'SUMMARY WORKSPACE READY' } else { Write-Host ('SUMMARY WORKSPACE OPEN missing=' + ($ws -join ',')) }
+  if ($appOk) { Write-Host 'SUMMARY APP VERIFIED' } else { Write-Host ('SUMMARY APP OPEN missing=' + ($app -join ',')) }
+  if ($recOk) { Write-Host 'SUMMARY RECONNECT VERIFIED' } else { Write-Host ('SUMMARY RECONNECT OPEN missing=' + ($rec -join ',')) }
+  if ($secOk) { Write-Host 'SUMMARY SECURITY COMPLETE' } else { Write-Host ('SUMMARY SECURITY OPEN missing=' + ($sec -join ',')) }
+  # administrator access: a candidate (an account in the sudo group) is never ADMIN_READY; the last sudo outcome is kept apart
+  $aRes = 'untested'; if ($ans.ContainsKey('admin_sudo_result')) { $aRes = $ans['admin_sudo_result'] }
+  $aAct = 'untested'; if ($ans.ContainsKey('admin_sudo_actor')) { $aAct = $ans['admin_sudo_actor'] }
+  $aCan = 'unknown'; if ($ans.ContainsKey('admin_candidate')) { $aCan = $ans['admin_candidate'] }
+  $aCtx = 'none'; if ($ans.ContainsKey('admin_context')) { $aCtx = $ans['admin_context'] }
+  if (Fact-Ok $facts 'ADMIN_READY') { Write-Host ('SUMMARY ADMIN READY confirmed_in=' + $aCtx) }
+  elseif (($aCan -eq 'current_user_in_sudo_group') -or ($aCan -eq 'other_account_in_sudo_group')) { Write-Host ('SUMMARY ADMIN CANDIDATE_ONLY candidate=' + $aCan + ' last_sudo_actor=' + $aAct + ' last_sudo_result=' + $aRes + ' (not confirmed administrative access)') }
+  else { Write-Host ('SUMMARY ADMIN NOT_PROVEN candidate=' + $aCan + ' last_sudo_actor=' + $aAct + ' last_sudo_result=' + $aRes) }
+  if ($trOk) { Write-Host 'SUMMARY TRAINING COMPLETE' }
+  elseif ($trSkipped) { Write-Host ('SUMMARY TRAINING SKIPPED done=' + $trPass + '/' + $TrainNames.Count) }
+  else { Write-Host ('SUMMARY TRAINING OPEN done=' + $trPass + '/' + $TrainNames.Count) }
+  $hid = Fact-Status $facts 'HOST_IDENTITY'
+  if ($hid -ne 'PASS') { Write-Host ('SUMMARY NOTE host_identity=' + $hid + ' (not independently verified)') }
+  if ($wsOk -and $appOk -and $recOk -and $secOk -and $trOk -and ($hid -eq 'PASS')) { Write-Host 'SUMMARY OVERALL FULL_PASS' } else { Write-Host 'SUMMARY OVERALL PARTIAL' }
+  # the optional Neuro-lab offer: after the result and the training decision, independent of security; shown once
+  if ($ans.ContainsKey('neurolab_offer')) { Write-Host ('SUMMARY OFFER not_eligible reason=already_' + $ans['neurolab_offer']) }
+  elseif ($appOk -and $recOk -and ($trOk -or $trSkipped)) {
+    $br = 'ask_member'
+    if ($ans.ContainsKey('neurolab_member')) { if ($ans['neurolab_member'] -eq 'yes') { $br = 'resident' } elseif ($ans['neurolab_member'] -eq 'no') { $br = 'new' } }
+    $oc = Offer-Config
+    $cta = 'hidden'; if ($oc.Ready) { $cta = 'ready' }
+    Write-Host ('SUMMARY OFFER eligible branch=' + $br + ' cta=' + $cta + ' (' + $oc.Reason + ')')
+  } else { Write-Host 'SUMMARY OFFER not_eligible reason=result_or_training_not_done' }
+  Write-Host ('SUMMARY GENERATION ' + (Load-Meta)['generation'])
+  exit 0
+}
+
 # ---------- safe report: kit version, OS label, stage table, check ids/statuses; no paths, addresses, names ----------
 if ($Report) {
   $osv = ''
   foreach ($l in (Read-Lines $FDiag)) { $p = $l -split "`t"; if ($p[0] -eq 'os') { $osv = $p[2] } }
   Write-Host ('REPORT kit=' + $KitVersion + ' os=' + $osv)
   foreach ($l in (Read-Lines $FStages)) { if ($l.Trim().Length -gt 0) { Write-Host ('REPORT_STAGE ' + ($l -replace "`t", ' ')) } }
+  foreach ($l in (Read-Lines $FFacts)) { if ($l.Trim().Length -gt 0) { Write-Host ('REPORT_FACT ' + ($l -replace "`t", ' ')) } }
+  $rm = Load-Meta
+  if ($rm.ContainsKey('generation')) { Write-Host ('REPORT_GENERATION ' + $rm['generation']) }
   foreach ($l in (Read-Lines $FDiag)) { $p = $l -split "`t"; if ($p.Count -ge 3) { Write-Host ('REPORT_CHECK ' + $p[0] + ' ' + $p[1] + ' ' + $p[2]) } }
   Write-Host 'REPORT_END (add: stage number, what you saw in your own words WITHOUT passwords, keys, IP addresses, user names, paths)'
   exit 0
@@ -240,6 +483,8 @@ if ($Report) {
 # ---------- diagnostics ----------
 if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
 $hadStages = Test-Path -LiteralPath $FStages
+$migratedNow = Ensure-Meta
+if ($migratedNow -and $hadStages) { Write-Host 'STATE_MIGRATED schema=2 (backup in state\backup-schema1)' }
 $answers = Load-Answers
 Append-Line $FEvents ('{"v":1,"ts":"' + (NowUtc) + '","run":"' + $RunId + '","ev":"run_start","exec_ms":null,"wait_ms":null}')
 
@@ -269,10 +514,14 @@ Add-Check 'kit' $t.R[0] $t.R[1] 'L' $t.Ms
 
 # os
 $t = Timed {
-  if ($env:OS -eq 'Windows_NT') { return @('PASS', ('windows-' + [Environment]::OSVersion.Version.ToString())) }
+  if ([Environment]::OSVersion.Platform -eq 'Win32NT') { return @('PASS', ('windows-' + [Environment]::OSVersion.Version.ToString())) }
   return @('UNKNOWN', 'not-windows; use tools/diagnose.sh')
 }
 Add-Check 'os' $t.R[0] $t.R[1] 'L' $t.Ms
+
+# place of execution: host OS, shell and the VPS are different things
+if ([Environment]::OSVersion.Platform -eq 'Win32NT') { Add-Check 'exec_place' 'PASS' 'laptop_windows' 'L' 0 }
+else { Add-Check 'exec_place' 'UNKNOWN' 'not-windows' '?' 0 }
 
 # VS Code and extensions
 $t = Timed { Probe 'code' @('--version') }
@@ -331,6 +580,12 @@ foreach ($pm in @(@('perm_claude', 'claude_permission', 'Claude permission mode 
     elseif ($v -eq 'manual' -or $v -eq 'default' -or $v -eq 'none') { Add-Check $pm[0] 'PASS' ('reported ' + $v) 'U' 0 }
     else { Add-Check $pm[0] 'UNKNOWN' ('reported ' + $v) 'U' 0 }
   } else { Add-Check $pm[0] 'UNKNOWN' 'not detectable by script' '?' 0; Ask $pm[1] $pm[2] }
+}
+
+foreach ($q in @(@('entry_mode', 'How to continue: gpt_guide (recommended for newcomers) or vscode_direct?'),
+                 @('server_state', 'Server state: none, existing_active, replaced or unknown?'),
+                 @('engine_mode', 'Engines: claude_only, codex_only, both or undecided?'))) {
+  if (-not $answers.ContainsKey($q[0])) { Ask $q[0] $q[1] }
 }
 
 # ---------- write diagnostics (latest run only: replaced, not appended) ----------
