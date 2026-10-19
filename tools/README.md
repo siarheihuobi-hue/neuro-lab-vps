@@ -25,10 +25,11 @@
 | `-Attempt AREA -Symptom -Hypothesis -Action -Result -Knowledge yes/no/pending` | `--attempt AREA --symptom ...` | запись в `state/attempts.tsv`; после двух подряд без нового знания следующая попытка отказывается (код 2); та же гипотеза и действие под другим названием области считаются той же попыткой; `pending` — опрос уже запущенной операции, не более 5 подряд |
 | `-AttemptCheck AREA` | `--attempt-check AREA` | `OK` или `STOP` по области |
 | `-Change AREA -Source KIND -Action CODE` | `--change AREA --source KIND --action CODE` | записать конкретное изменение условий (KIND из закрытого списка: other_device, other_browser, other_network, other_account, corrected_parameter, new_fact, new_candidate, provider_reply, new_generation, new_tool, owner_decision) и снять остановку; принимается только для остановленной области и не дважды подряд |
+| `-Offers` | `--offers` | какое ОДНО предложение или помощь уместны сейчас: строки `OFFER_GUIDE`, `OFFER_HELP`, `OFFER_CHANNEL`, `OFFER_NEUROLAB` и `NEXT_OFFER` (проводник на прямом входе, помощь при блокере, канал после итога, Neuro-lab после ответа на канал); учитывает отказы и прежний выбор; тексты — `templates/offers.md`; ничего не отправляет и не открывает |
 | `-Context` | `--context` | версия установки, окно, папка, сервер, инструменты, незавершённые операции |
 | `-Export` | `--export` | `state/export.txt` для ручной передачи; ничего не отправляется автоматически |
 
-Статусы фактов дополнены `DEFERRED` (отложено решением) и `NOT_APPLICABLE` (не относится к пути); `NOT_TESTED` читается как `NOT_RUN`, старые записи не переименовываются. Области попыток: HOST_IDENTITY, SSH_AUTH, ADMIN_ACCESS, RECOVERY, CONSOLE, PANEL, PROVIDER_API, ENGINE, PERMISSION, TUNNEL, MIGRATION, OTHER.
+Статусы фактов дополнены `DEFERRED` (отложено решением) и `NOT_APPLICABLE` (не относится к пути); `NOT_TESTED` читается как `NOT_RUN`, старые записи не переименовываются. Ответы-предложения для `-Answer`: `guide_offer`, `help_offer`, `channel_offer` (`shown`, `accepted`, `declined`, `skipped`), `neurolab_offer` (`shown`, `declined`, `interested`, `already_member`). Области попыток: HOST_IDENTITY, SSH_AUTH, ADMIN_ACCESS, RECOVERY, CONSOLE, PANEL, PROVIDER_API, ENGINE, PERMISSION, TUNNEL, MIGRATION, OTHER.
 
 ## Помощник провайдера (отдельный файл)
 

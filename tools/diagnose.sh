@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # diagnose.sh - read-only start diagnostics for the VPS workshop kit (macOS branch; also runs in the remote Linux window).
-# Kit 0.3.0-preview. macOS and Linux branches are UNVERIFIED on a real machine of that kind (see README).
+# Kit 0.3.1-preview. macOS and Linux branches are UNVERIFIED on a real machine of that kind (see README).
 # It never changes the system, network, VPN, SSH, keys or settings. It writes only under <kit>/state/.
 #
 # Usage:
@@ -18,13 +18,14 @@
 #   bash tools/diagnose.sh --attempt CONSOLE --symptom no-paste --hypothesis focus --action click-field --result same --knowledge no
 #   bash tools/diagnose.sh --attempt-check CONSOLE   (ALLOWED or STOP after two attempts without new knowledge)
 #   bash tools/diagnose.sh --change CONSOLE --source other_browser --action switch-to-firefox   (a concrete change of conditions; only for a stopped area)
+#   bash tools/diagnose.sh --offers     (which ONE offer or help is appropriate now: OFFER_* lines and NEXT_OFFER; texts: templates/offers.md)
 #   bash tools/diagnose.sh --context     (version of THIS installation, OS, window, generation, tools)
 #   bash tools/diagnose.sh --export      (safe local export for MANUAL transfer; nothing is sent)
 #
 # bash 3.2 compatible (macOS default): no associative arrays, no ${var,,}.
 
 set -u
-KIT_VERSION="0.3.0-preview"
+KIT_VERSION="0.3.1-preview"
 KIT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STATE="$KIT_ROOT/state"
 TEL="$STATE/telemetry"
@@ -75,6 +76,7 @@ allowed_answer() { # key value -> 0 if allowed
     map_ready:yes|map_ready:no) return 0 ;;
     project_link:parent|project_link:standalone) return 0 ;;
     neurolab_offer:shown|neurolab_offer:declined|neurolab_offer:interested|neurolab_offer:already_member) return 0 ;;
+    guide_offer:shown|guide_offer:accepted|guide_offer:declined|guide_offer:skipped|help_offer:shown|help_offer:accepted|help_offer:declined|help_offer:skipped|channel_offer:shown|channel_offer:accepted|channel_offer:declined|channel_offer:skipped) return 0 ;;
     neurolab_member:yes|neurolab_member:no|neurolab_member:unknown) return 0 ;;
     provider_type:api_available|provider_type:api_limited|provider_type:api_not_found|provider_type:api_not_checked|provider_type:panel_only|provider_type:unknown) return 0 ;;
     entry_mode:gpt_guide|entry_mode:vscode_direct) return 0 ;;
@@ -252,7 +254,7 @@ offer_ready() {
 
 # ---------- control subcommands (do not run diagnostics) ----------
 ACCEPT=""; SOURCE=""; EVIDENCE=""; NOTE=""; RESET=""; ANSWERS=""; REPORT=0; CLAIM=""; FACTS=""; NEWSERVER=0; MIGRATE=0; SUMMARY=0
-CHECKPOINTS=0; CONTEXT=0; EXPORT=0; SCOPE=""; BLOCKER=""; RETRY=""; ATTEMPT=""; ATTEMPT_CHECK=""; CHANGE=""; SYMPTOM=""; HYPOTHESIS=""; ACTION=""; RESULT=""; KNOWLEDGE=""
+OFFERS=0; CHECKPOINTS=0; CONTEXT=0; EXPORT=0; SCOPE=""; BLOCKER=""; RETRY=""; ATTEMPT=""; ATTEMPT_CHECK=""; CHANGE=""; SYMPTOM=""; HYPOTHESIS=""; ACTION=""; RESULT=""; KNOWLEDGE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --answer) shift; [ $# -gt 0 ] || fail "--answer needs key=value"; ANSWERS="$ANSWERS $1" ;;
@@ -273,6 +275,7 @@ while [ $# -gt 0 ]; do
     --scope) shift; SCOPE="${1:-}" ;;
     --blocker) shift; BLOCKER="${1:-}" ;;
     --retry) shift; RETRY="${1:-}" ;;
+    --offers) OFFERS=1 ;;
     --attempt) shift; ATTEMPT="${1:-}" ;;
     --attempt-check) shift; ATTEMPT_CHECK="${1:-}" ;;
     --change) shift; CHANGE="${1:-}" ;;
@@ -429,6 +432,7 @@ if [ -n "$CHANGE" ]; then
   attempt_append "$CHANGE" change - - "$ACTION" "$SOURCE" yes
   echo "CONDITIONS_CHANGED area=$CHANGE kind=$SOURCE change=$ACTION"
 fi
+if [ "$OFFERS" -eq 1 ]; then bash "$0" --summary | grep -E '^SUMMARY (OFFER|NEXT_OFFER)' | sed 's/^SUMMARY //'; exit 0; fi
 if [ "$CHECKPOINTS" -eq 1 ]; then
   CTL=1; ensure_state; ensure_meta
   for cn in HOST_IDENTITY SSH_AUTH ADMIN_ACCESS RECOVERY; do chk_line "$cn"; done
@@ -499,14 +503,40 @@ if [ "$SUMMARY" -eq 1 ]; then
   hid="$(fs HOST_IDENTITY)"
   [ "$hid" = "PASS" ] || echo "SUMMARY NOTE host_identity=$hid (not independently verified)"
   if [ -z "$ws$app$rec$sec" ] && [ "$tr_ok" -eq 1 ] && [ "$hid" = "PASS" ]; then echo "SUMMARY OVERALL FULL_PASS"; else echo "SUMMARY OVERALL PARTIAL"; fi
-  offer="$(get_answer neurolab_offer)"
-  if [ -n "$offer" ]; then echo "SUMMARY OFFER not_eligible reason=already_$offer"
-  elif [ -z "$app$rec" ] && { [ "$tr_ok" -eq 1 ] || [ "$tr_skipped" -eq 1 ]; }; then
-    mem="$(get_answer neurolab_member)"; br="ask_member"
-    [ "$mem" = "yes" ] && br="resident"; [ "$mem" = "no" ] && br="new"
-    cta="hidden"; offer_ready && cta="ready"
-    echo "SUMMARY OFFER eligible branch=$br cta=$cta ($OFFER_REASON)"
-  else echo "SUMMARY OFFER not_eligible reason=result_or_training_not_done"; fi
+  # offers: ONE at a time, in context; refusals and earlier choices are respected (texts: templates/offers.md)
+  o_entry="$(get_answer entry_mode)"; o_guide="$(get_answer guide_offer)"; o_help="$(get_answer help_offer)"; o_chan="$(get_answer channel_offer)"; o_nl="$(get_answer neurolab_offer)"
+  o_blk=0; for ar in $ATTEMPT_AREAS; do [ "$(attempt_count "$ar")" -ge 2 ] && o_blk=1; done
+  [ -f "$F_FACTS" ] && [ -n "$(awk -F'\t' '$2=="BLOCKED"{print "x"; exit}' "$F_FACTS")" ] && o_blk=1
+  o_prog=0; i=3; while [ "$i" -le 12 ]; do case "$(stage_status "$i")" in PASS|CLAIMED) o_prog=1 ;; esac; i=$((i + 1)); done
+  o_done=0; [ -z "$app$rec" ] && { [ "$tr_ok" -eq 1 ] || [ "$tr_skipped" -eq 1 ]; } && o_done=1
+  if [ "$o_entry" != "vscode_direct" ]; then og="not_eligible reason=entry_is_${o_entry:-not_chosen}"
+  elif [ -n "$o_guide" ]; then og="not_eligible reason=already_$o_guide"
+  elif [ "$o_blk" -eq 1 ]; then og="not_eligible reason=blocker_active_help_first"
+  elif [ "$o_prog" -eq 1 ]; then og="not_eligible reason=route_in_progress"
+  else og="eligible"; fi
+  if [ "$o_blk" -ne 1 ]; then oh="not_eligible reason=no_unresolved_blocker"
+  elif [ -n "$o_help" ]; then oh="not_eligible reason=already_$o_help"
+  else oh="eligible"; fi
+  if [ "$o_blk" -eq 1 ]; then oc="not_eligible reason=blocker_active_help_first"
+  elif [ -n "$o_chan" ]; then oc="not_eligible reason=already_$o_chan"
+  elif [ "$o_done" -eq 1 ]; then oc="eligible"
+  else oc="not_eligible reason=result_or_training_not_done"; fi
+  mem="$(get_answer neurolab_member)"; br="ask_member"; [ "$mem" = "yes" ] && br="resident"; [ "$mem" = "no" ] && br="new"
+  cta="hidden"; offer_ready && cta="ready"
+  if [ -n "$o_nl" ]; then on="not_eligible reason=already_$o_nl"
+  elif [ "$o_blk" -eq 1 ]; then on="not_eligible reason=blocker_active_help_first"
+  elif [ "$o_done" -ne 1 ]; then on="not_eligible reason=result_or_training_not_done"
+  elif [ -z "$o_chan" ]; then on="not_eligible reason=channel_first"
+  elif [ "$o_chan" = "shown" ]; then on="not_eligible reason=waiting_for_the_reply_to_the_channel"
+  elif [ "$o_chan" = "declined" ] && [ "$o_guide" != "accepted" ] && [ "$o_help" != "accepted" ]; then on="not_eligible reason=all_offers_declined"
+  else on="eligible branch=$br cta=$cta ($OFFER_REASON)"; fi
+  echo "SUMMARY OFFER_GUIDE $og"; echo "SUMMARY OFFER_HELP $oh"; echo "SUMMARY OFFER_CHANNEL $oc"; echo "SUMMARY OFFER_NEUROLAB $on"
+  nx="none"
+  case "$oh" in eligible*) nx="help" ;; esac
+  [ "$nx" = "none" ] && case "$og" in eligible*) nx="guide" ;; esac
+  [ "$nx" = "none" ] && case "$oc" in eligible*) nx="channel" ;; esac
+  [ "$nx" = "none" ] && case "$on" in eligible*) nx="neurolab" ;; esac
+  echo "SUMMARY NEXT_OFFER $nx"
   cps2=""; for cn in HOST_IDENTITY SSH_AUTH ADMIN_ACCESS RECOVERY; do cps2="$cps2 $cn=$(chk_status "$cn")"; done
   echo "SUMMARY CHECKPOINTS$cps2"
   dfr=""; nap=""

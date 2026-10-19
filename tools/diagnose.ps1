@@ -1,6 +1,6 @@
 <#
  diagnose.ps1 - read-only start diagnostics for the VPS workshop kit (Windows branch).
- Kit 0.3.0-preview.
+ Kit 0.3.1-preview.
  ASCII only on purpose: Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI.
  It never changes the system, network, VPN, SSH, keys or settings. It writes only under <kit>\state\.
 
@@ -15,6 +15,7 @@
    powershell -NoProfile -File tools\diagnose.ps1 -NewServer -Source owner-message   (a NEW server: new generation, old server facts do not carry over)
    powershell -NoProfile -File tools\diagnose.ps1 -Migrate    (idempotent state migration to schema 2; also done on a normal run)
    powershell -NoProfile -File tools\diagnose.ps1 -Summary    (five separate results: workspace, app, reconnect, security, training)
+   powershell -NoProfile -File tools\diagnose.ps1 -Offers    (which ONE offer or help is appropriate now: OFFER_* lines and NEXT_OFFER; texts: templates/offers.md)
    powershell -NoProfile -File tools\diagnose.ps1 -Checkpoints    (the four access checkpoints with status, source, scope, blocker, retry condition)
    powershell -NoProfile -File tools\diagnose.ps1 -Attempt CONSOLE -Symptom no-paste -Hypothesis focus -Action click-field -Result same -Knowledge no   (attempt log)
    powershell -NoProfile -File tools\diagnose.ps1 -AttemptCheck CONSOLE    (ALLOWED or STOP after two attempts without new knowledge)
@@ -37,6 +38,7 @@ param(
   [switch]$Migrate,
   [switch]$Summary,
   [switch]$Checkpoints,
+  [switch]$Offers,
   [switch]$Context,
   [switch]$Export,
   [string]$Scope = '',
@@ -54,7 +56,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$KitVersion = '0.3.0-preview'
+$KitVersion = '0.3.1-preview'
 $KitRoot  = Split-Path -Parent $PSScriptRoot
 $StateDir = Join-Path $KitRoot 'state'
 $TelDir   = Join-Path $StateDir 'telemetry'
@@ -125,6 +127,9 @@ $AllowedAnswers = @{
   'map_ready'           = @('yes', 'no');
   'project_link'        = @('parent', 'standalone');
   'neurolab_offer'      = @('shown', 'declined', 'interested', 'already_member');
+  'guide_offer'         = @('shown', 'accepted', 'declined', 'skipped');
+  'help_offer'          = @('shown', 'accepted', 'declined', 'skipped');
+  'channel_offer'       = @('shown', 'accepted', 'declined', 'skipped');
   'neurolab_member'     = @('yes', 'no', 'unknown');
   'entry_mode'          = @('gpt_guide', 'vscode_direct');
   'server_state'        = @('none', 'existing_active', 'replaced', 'unknown');
@@ -624,6 +629,12 @@ if ($ctl) { exit 0 }
 
 
 # ---------- summary: five separate results, never one general PASS from partial facts ----------
+if ($Offers) {
+  # which ONE offer or help is appropriate now (the summary computes it; only the offer lines are shown)
+  $so = & $PSCommandPath -Summary 6>&1
+  foreach ($l in $so) { $t = [string]$l; if ($t -match '^SUMMARY (OFFER|NEXT_OFFER)') { Write-Host $t.Substring(8) } }
+  exit 0
+}
 if ($Summary) {
   [void](Ensure-Meta)
   $st = Load-Stages
@@ -657,14 +668,42 @@ if ($Summary) {
   if ($hid -ne 'PASS') { Write-Host ('SUMMARY NOTE host_identity=' + $hid + ' (not independently verified)') }
   if ($wsOk -and $appOk -and $recOk -and $secOk -and $trOk -and ($hid -eq 'PASS')) { Write-Host 'SUMMARY OVERALL FULL_PASS' } else { Write-Host 'SUMMARY OVERALL PARTIAL' }
   # the optional Neuro-lab offer: after the result and the training decision, independent of security; shown once
-  if ($ans.ContainsKey('neurolab_offer')) { Write-Host ('SUMMARY OFFER not_eligible reason=already_' + $ans['neurolab_offer']) }
-  elseif ($appOk -and $recOk -and ($trOk -or $trSkipped)) {
-    $br = 'ask_member'
-    if ($ans.ContainsKey('neurolab_member')) { if ($ans['neurolab_member'] -eq 'yes') { $br = 'resident' } elseif ($ans['neurolab_member'] -eq 'no') { $br = 'new' } }
-    $oc = Offer-Config
-    $cta = 'hidden'; if ($oc.Ready) { $cta = 'ready' }
-    Write-Host ('SUMMARY OFFER eligible branch=' + $br + ' cta=' + $cta + ' (' + $oc.Reason + ')')
-  } else { Write-Host 'SUMMARY OFFER not_eligible reason=result_or_training_not_done' }
+  # offers: ONE at a time, in context; refusals and earlier choices are respected (texts: templates/offers.md)
+  $oEntry = ''; if ($ans.ContainsKey('entry_mode')) { $oEntry = $ans['entry_mode'] }
+  $oGuide = ''; if ($ans.ContainsKey('guide_offer')) { $oGuide = $ans['guide_offer'] }
+  $oHelp = ''; if ($ans.ContainsKey('help_offer')) { $oHelp = $ans['help_offer'] }
+  $oChan = ''; if ($ans.ContainsKey('channel_offer')) { $oChan = $ans['channel_offer'] }
+  $oNl = ''; if ($ans.ContainsKey('neurolab_offer')) { $oNl = $ans['neurolab_offer'] }
+  $oBlk = $false; foreach ($ar in $AttemptAreas) { if ((Attempt-Count $ar) -ge 2) { $oBlk = $true } }
+  foreach ($k in $facts.Keys) { if ($facts[$k][1] -eq 'BLOCKED') { $oBlk = $true } }
+  $oProg = $false; for ($i = 3; $i -le 12; $i++) { if (@('PASS', 'CLAIMED') -contains $st[$i][1]) { $oProg = $true } }
+  $oDone = ($appOk -and $recOk -and ($trOk -or $trSkipped))
+  if ($oEntry -ne 'vscode_direct') { $nr = 'not_chosen'; if ($oEntry) { $nr = $oEntry }; $og = 'not_eligible reason=entry_is_' + $nr }
+  elseif ($oGuide) { $og = 'not_eligible reason=already_' + $oGuide }
+  elseif ($oBlk) { $og = 'not_eligible reason=blocker_active_help_first' }
+  elseif ($oProg) { $og = 'not_eligible reason=route_in_progress' }
+  else { $og = 'eligible' }
+  if (-not $oBlk) { $oh = 'not_eligible reason=no_unresolved_blocker' }
+  elseif ($oHelp) { $oh = 'not_eligible reason=already_' + $oHelp }
+  else { $oh = 'eligible' }
+  if ($oBlk) { $oc = 'not_eligible reason=blocker_active_help_first' }
+  elseif ($oChan) { $oc = 'not_eligible reason=already_' + $oChan }
+  elseif ($oDone) { $oc = 'eligible' }
+  else { $oc = 'not_eligible reason=result_or_training_not_done' }
+  $br = 'ask_member'
+  if ($ans.ContainsKey('neurolab_member')) { if ($ans['neurolab_member'] -eq 'yes') { $br = 'resident' } elseif ($ans['neurolab_member'] -eq 'no') { $br = 'new' } }
+  $oc2 = Offer-Config; $cta = 'hidden'; if ($oc2.Ready) { $cta = 'ready' }
+  if ($oNl) { $on = 'not_eligible reason=already_' + $oNl }
+  elseif ($oBlk) { $on = 'not_eligible reason=blocker_active_help_first' }
+  elseif (-not $oDone) { $on = 'not_eligible reason=result_or_training_not_done' }
+  elseif (-not $oChan) { $on = 'not_eligible reason=channel_first' }
+  elseif ($oChan -eq 'shown') { $on = 'not_eligible reason=waiting_for_the_reply_to_the_channel' }
+  elseif (($oChan -eq 'declined') -and ($oGuide -ne 'accepted') -and ($oHelp -ne 'accepted')) { $on = 'not_eligible reason=all_offers_declined' }
+  else { $on = 'eligible branch=' + $br + ' cta=' + $cta + ' (' + $oc2.Reason + ')' }
+  Write-Host ('SUMMARY OFFER_GUIDE ' + $og); Write-Host ('SUMMARY OFFER_HELP ' + $oh); Write-Host ('SUMMARY OFFER_CHANNEL ' + $oc); Write-Host ('SUMMARY OFFER_NEUROLAB ' + $on)
+  $nx = 'none'
+  if ($oh -like 'eligible*') { $nx = 'help' } elseif ($og -like 'eligible*') { $nx = 'guide' } elseif ($oc -like 'eligible*') { $nx = 'channel' } elseif ($on -like 'eligible*') { $nx = 'neurolab' }
+  Write-Host ('SUMMARY NEXT_OFFER ' + $nx)
   $cps2 = @(); foreach ($cn in @('HOST_IDENTITY', 'SSH_AUTH', 'ADMIN_ACCESS', 'RECOVERY')) { $cps2 += ($cn + '=' + (Chk-Line $cn $facts).Status) }
   Write-Host ('SUMMARY CHECKPOINTS ' + ($cps2 -join ' '))
   $dfr = @(); $nap = @()
