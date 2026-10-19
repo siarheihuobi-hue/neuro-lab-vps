@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # diagnose.sh - read-only start diagnostics for the VPS workshop kit (macOS branch; also runs in the remote Linux window).
-# Kit 0.2.0-preview. macOS and Linux branches are UNVERIFIED on a real machine of that kind (see README).
+# Kit 0.3.0-preview. macOS and Linux branches are UNVERIFIED on a real machine of that kind (see README).
 # It never changes the system, network, VPN, SSH, keys or settings. It writes only under <kit>/state/.
 #
 # Usage:
@@ -14,11 +14,17 @@
 #   bash tools/diagnose.sh --new-server --source owner-message   (a NEW server: new generation, old server facts do not carry over)
 #   bash tools/diagnose.sh --migrate     (idempotent state migration to schema 2; also done on a normal run)
 #   bash tools/diagnose.sh --summary     (five separate results: workspace, app, reconnect, security, training)
+#   bash tools/diagnose.sh --checkpoints (the four access checkpoints with status, source, scope, blocker, retry condition)
+#   bash tools/diagnose.sh --attempt CONSOLE --symptom no-paste --hypothesis focus --action click-field --result same --knowledge no
+#   bash tools/diagnose.sh --attempt-check CONSOLE   (ALLOWED or STOP after two attempts without new knowledge)
+#   bash tools/diagnose.sh --change CONSOLE --source other_browser --action switch-to-firefox   (a concrete change of conditions; only for a stopped area)
+#   bash tools/diagnose.sh --context     (version of THIS installation, OS, window, generation, tools)
+#   bash tools/diagnose.sh --export      (safe local export for MANUAL transfer; nothing is sent)
 #
 # bash 3.2 compatible (macOS default): no associative arrays, no ${var,,}.
 
 set -u
-KIT_VERSION="0.2.0-preview"
+KIT_VERSION="0.3.0-preview"
 KIT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STATE="$KIT_ROOT/state"
 TEL="$STATE/telemetry"
@@ -70,6 +76,7 @@ allowed_answer() { # key value -> 0 if allowed
     project_link:parent|project_link:standalone) return 0 ;;
     neurolab_offer:shown|neurolab_offer:declined|neurolab_offer:interested|neurolab_offer:already_member) return 0 ;;
     neurolab_member:yes|neurolab_member:no|neurolab_member:unknown) return 0 ;;
+    provider_type:api_available|provider_type:api_limited|provider_type:api_not_found|provider_type:api_not_checked|provider_type:panel_only|provider_type:unknown) return 0 ;;
     entry_mode:gpt_guide|entry_mode:vscode_direct) return 0 ;;
     server_state:none|server_state:existing_active|server_state:replaced|server_state:unknown) return 0 ;;
     purchase_profile:base|purchase_profile:recommended|purchase_profile:existing|purchase_profile:undecided) return 0 ;;
@@ -96,7 +103,7 @@ hash_of() {
 
 # ---------- state schema 2: finer facts, server generation ----------
 # facts.tsv: fact, status, label, source, date, generation.  meta.tsv: schema, target_id, generation, created, migrated_from.
-FACT_NAMES="SERVER_PURCHASED SERVER_ACTIVE HOST_IDENTITY KEY_READY KEY_INSTALLED KEY_LOGIN PREFLIGHT ADMIN_READY UFW SSH_HARDENING ENGINE_READY TEAM_LOADED QA APP_BROWSER RECONNECT TRAIN_REMOTE_WINDOW TRAIN_OPEN_PROJECT TRAIN_NEW_PROJECT TRAIN_SESSION TRAIN_TASK TRAIN_PORTS TRAIN_DISK TRAIN_RESUME TRAINING"
+FACT_NAMES="SERVER_PURCHASED SERVER_ACTIVE HOST_IDENTITY KEY_READY KEY_INSTALLED KEY_LOGIN SSH_AUTH PREFLIGHT ADMIN_READY RECOVERY UFW SSH_HARDENING ENGINE_READY TEAM_LOADED QA APP_BROWSER RECONNECT TRAIN_REMOTE_WINDOW TRAIN_OPEN_PROJECT TRAIN_NEW_PROJECT TRAIN_SESSION TRAIN_TASK TRAIN_PORTS TRAIN_DISK TRAIN_RESUME TRAINING"
 TRAIN_NAMES="TRAIN_REMOTE_WINDOW TRAIN_OPEN_PROJECT TRAIN_NEW_PROJECT TRAIN_SESSION TRAIN_TASK TRAIN_PORTS TRAIN_DISK TRAIN_RESUME"
 SERVER_ANSWERS="server_state purchase_profile region_state panel_access account_state admin_sudo_actor admin_sudo_result admin_candidate admin_context"
 stage_needs() {
@@ -119,10 +126,88 @@ fs() { # fact status, NOT_RUN when absent
   [ -n "$s" ] && echo "$s" || echo NOT_RUN
 }
 fact_ok() { s="$(fs "$1")"; [ "$s" = "PASS" ] && return 0; [ "$1" = "HOST_IDENTITY" ] && [ "$s" = "ACCEPTED_RISK" ] && return 0; return 1; }
-set_fact() { # name status label source gen
+set_fact() { # name status label source gen [scope blocker retry]
   tmp="$F_FACTS.tmp.$$"
-  { [ -f "$F_FACTS" ] && awk -F'\t' -v k="$1" '$1!=k' "$F_FACTS"; printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$(now)" "$5"; } > "$tmp" && mv "$tmp" "$F_FACTS"
+  { [ -f "$F_FACTS" ] && awk -F'\t' -v k="$1" '$1!=k' "$F_FACTS"; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$(now)" "$5" "${6:--}" "${7:--}" "${8:--}"; } > "$tmp" && mv "$tmp" "$F_FACTS"
 }
+CHANGE_KINDS="other_device other_browser other_network other_account corrected_parameter new_fact new_candidate provider_reply new_generation new_tool owner_decision"
+ATTEMPT_AREAS="HOST_IDENTITY SSH_AUTH ADMIN_ACCESS RECOVERY CONSOLE PANEL PROVIDER_API ENGINE PERMISSION TUNNEL MIGRATION OTHER"
+F_ATT="$STATE/attempts.tsv"
+F_EXPORT="$STATE/export.txt"
+# trailing attempts of an area without new knowledge since the last recorded change of conditions
+attempt_count() {
+  [ -f "$F_ATT" ] || { echo 0; return; }
+  awk -F'\t' -v a="$1" 'NF>=9 && $3==a { if ($4=="change") n=0; else if ($4=="attempt") { if ($9=="no") n++; else if ($9=="yes") n=0 } } END { print n+0 }' "$F_ATT"
+}
+# consecutive polls of an already started asynchronous operation (knowledge=pending); bounded, a result or a change resets
+pending_count() {
+  [ -f "$F_ATT" ] || { echo 0; return; }
+  awk -F'\t' -v a="$1" 'NF>=9 && $3==a { if ($4=="change") p=0; else if ($4=="attempt") { if ($9=="pending") p++; else p=0 } } END { print p+0 }' "$F_ATT"
+}
+# the same hypothesis+action without new knowledge, whatever the area is called; cleared by a change in the area where it began
+pair_count() { # hypothesis action
+  [ -f "$F_ATT" ] || { echo 0; return; }
+  awk -F'\t' -v h="$1" -v c="$2" 'NF>=9 { k=$6 "|" $7
+      if ($4=="change") { for (q in ar) if (ar[q]==$3) { delete n[q]; delete ar[q] } }
+      else if ($4=="attempt") { if ($9=="no") { if (!(k in ar)) ar[k]=$3; n[k]++ } else if ($9=="yes") { delete n[k]; delete ar[k] } } }
+    END { print n[h "|" c]+0 }' "$F_ATT"
+}
+attempt_append() { # area kind symptom hypothesis action result knowledge
+  c=1; [ -f "$F_ATT" ] && c=$(( $(wc -l < "$F_ATT" | tr -d ' ') + 1 ))
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$(now)" "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$F_ATT"
+}
+chk_token() { # value what
+  [ -z "$1" ] || printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_.+-]{1,40}$' || fail "$2 must match A-Za-z0-9_.+- (1-40 chars; codes only, no free text, no secrets)"
+  if [ -n "$1" ] && printf '%s' "$1" | grep -Eq '[A-Za-z0-9-]+[.][A-Za-z]{2,}'; then fail "$2 must not look like a host name (codes only)"; fi
+}
+unfinished_ops() {
+  u=""
+  [ -f "$F_FACTS" ] && u="$(awk -F'\t' '$2=="OPEN"||$2=="BLOCKED"||$2=="DEFERRED"{printf "%s%s=%s", (n++?",":""), $1, $2}' "$F_FACTS")"
+  for ar in $ATTEMPT_AREAS; do [ "$(attempt_count "$ar")" -ge 2 ] && u="$u${u:+,}STOPPED_$ar"; done
+  [ -n "$u" ] && echo "$u" || echo none
+}
+# last gate before a file leaves the state folder: nothing that looks like an address, host name, mail, path, URL, long hex/base64 or key block
+export_gate() { # file -> 0 when clean
+  if grep -Eiq '(^|[^0-9])[0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}($|[^0-9])|[A-Za-z0-9-]+[.][A-Za-z]{2,}([^A-Za-z]|$)|@|[/\]|://|[0-9a-f]{16,}|[A-Za-z0-9+]{32,}|([0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f]{1,4}|PRIVATE KEY|passw[o]rd=|toke[n]=' "$1"; then return 1; fi
+  return 0
+}
+# the four independent access checkpoints; old fact names are kept and mapped, not renamed
+chk_row() { # NAME -> sets CK_ROW (the facts row) and CK_VIA
+  CK_ROW=""; CK_VIA="$1"
+  case "$1" in
+    SSH_AUTH) CK_ROW="$(awk -F'\t' '$1=="SSH_AUTH"{print; exit}' "$F_FACTS" 2>/dev/null)"
+              if [ -z "$CK_ROW" ]; then CK_ROW="$(awk -F'\t' '$1=="KEY_LOGIN"{print; exit}' "$F_FACTS" 2>/dev/null)"; [ -n "$CK_ROW" ] && CK_VIA="KEY_LOGIN(compat)"; fi ;;
+    ADMIN_ACCESS) CK_ROW="$(awk -F'\t' '$1=="ADMIN_READY"{print; exit}' "$F_FACTS" 2>/dev/null)"; [ -n "$CK_ROW" ] && CK_VIA="ADMIN_READY(compat)" ;;
+    *) CK_ROW="$(awk -F'\t' -v k="$1" '$1==k{print; exit}' "$F_FACTS" 2>/dev/null)" ;;
+  esac
+}
+# a row counts only for the CURRENT target generation; compat rows (old fact names) also need local evidence (label with L)
+chk_gate() {
+  [ -n "$CK_ROW" ] || return 0
+  g="$(meta_get generation)"; rg="$(printf '%s' "$CK_ROW" | cut -f6)"
+  if [ -n "$g" ] && [ -n "$rg" ] && [ "$rg" != "$g" ]; then CK_VIA="$CK_VIA(stale_generation_ignored)"; CK_ROW=""; return 0; fi
+  case "$CK_VIA" in *"(compat)")
+    case "$(printf '%s' "$CK_ROW" | cut -f3)" in *L*) ;; *) CK_VIA="$CK_VIA(needs_local_evidence_ignored)"; CK_ROW="" ;; esac ;;
+  esac
+}
+chk_status() { chk_row "$1"; chk_gate; if [ -n "$CK_ROW" ]; then printf '%s' "$CK_ROW" | cut -f2; else echo NOT_RUN; fi; }
+chk_line() { # NAME
+  chk_row "$1"; chk_gate
+  case "$1" in
+    HOST_IDENTITY) purpose="host_key_belongs_to_the_target_server" ;;
+    SSH_AUTH) purpose="user_login_by_password_or_client_key" ;;
+    ADMIN_ACCESS) purpose="confirmed_user_can_do_administrative_actions" ;;
+    *) purpose="verified_backup_channel_and_who_may_use_it" ;;
+  esac
+  st="NOT_RUN"; src="-"; dt="-"; sc="-"; bl="-"; rt="-"
+  if [ -n "$CK_ROW" ]; then
+    st="$(printf '%s' "$CK_ROW" | cut -f2)"; src="$(printf '%s' "$CK_ROW" | cut -f4)"; dt="$(printf '%s' "$CK_ROW" | cut -f5)"
+    x="$(printf '%s' "$CK_ROW" | cut -f7)"; [ -n "$x" ] && sc="$x"; x="$(printf '%s' "$CK_ROW" | cut -f8)"; [ -n "$x" ] && bl="$x"; x="$(printf '%s' "$CK_ROW" | cut -f9)"; [ -n "$x" ] && rt="$x"
+  fi
+  ex=""; if [ "$1" = "RECOVERY" ]; then ar_="no"; [ "$st" = "PASS" ] && [ "$sc" = "agent_channel" ] && ar_="yes"; ex=" agent_can_rollback=$ar_"; fi
+  echo "CHECKPOINT $1 status=$st purpose=$purpose source=$src date=$dt scope=$sc blocker=$bl retry=$rt via=$CK_VIA$ex"
+}
+
 meta_get() { [ -f "$F_META" ] && awk -F'\t' -v k="$1" '$1==k{print $2; exit}' "$F_META" || true; }
 meta_put() { # key value
   tmp="$F_META.tmp.$$"
@@ -167,6 +252,7 @@ offer_ready() {
 
 # ---------- control subcommands (do not run diagnostics) ----------
 ACCEPT=""; SOURCE=""; EVIDENCE=""; NOTE=""; RESET=""; ANSWERS=""; REPORT=0; CLAIM=""; FACTS=""; NEWSERVER=0; MIGRATE=0; SUMMARY=0
+CHECKPOINTS=0; CONTEXT=0; EXPORT=0; SCOPE=""; BLOCKER=""; RETRY=""; ATTEMPT=""; ATTEMPT_CHECK=""; CHANGE=""; SYMPTOM=""; HYPOTHESIS=""; ACTION=""; RESULT=""; KNOWLEDGE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --answer) shift; [ $# -gt 0 ] || fail "--answer needs key=value"; ANSWERS="$ANSWERS $1" ;;
@@ -181,6 +267,20 @@ while [ $# -gt 0 ]; do
     --new-server) NEWSERVER=1 ;;
     --migrate) MIGRATE=1 ;;
     --summary) SUMMARY=1 ;;
+    --checkpoints) CHECKPOINTS=1 ;;
+    --context) CONTEXT=1 ;;
+    --export) EXPORT=1 ;;
+    --scope) shift; SCOPE="${1:-}" ;;
+    --blocker) shift; BLOCKER="${1:-}" ;;
+    --retry) shift; RETRY="${1:-}" ;;
+    --attempt) shift; ATTEMPT="${1:-}" ;;
+    --attempt-check) shift; ATTEMPT_CHECK="${1:-}" ;;
+    --change) shift; CHANGE="${1:-}" ;;
+    --symptom) shift; SYMPTOM="${1:-}" ;;
+    --hypothesis) shift; HYPOTHESIS="${1:-}" ;;
+    --action) shift; ACTION="${1:-}" ;;
+    --result) shift; RESULT="${1:-}" ;;
+    --knowledge) shift; KNOWLEDGE="${1:-}" ;;
     *) fail "unknown option: $1" ;;
   esac
   shift
@@ -189,6 +289,10 @@ done
 for tok in "$SOURCE" "$NOTE"; do
   if printf '%s' "$tok" | grep -Eq '(^|[^0-9])[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}($|[^0-9])'; then fail "source and note must not look like an IP address"; fi
 done
+for tok in "$SCOPE" "$BLOCKER" "$RETRY" "$SYMPTOM" "$HYPOTHESIS" "$ACTION" "$RESULT" "$KNOWLEDGE"; do
+  if printf '%s' "$tok" | grep -Eq '(^|[^0-9])[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}($|[^0-9])'; then fail "codes must not look like an IP address"; fi
+done
+chk_token "$SOURCE" source; chk_token "$SCOPE" scope; chk_token "$BLOCKER" blocker; chk_token "$RETRY" retry; chk_token "$SYMPTOM" symptom; chk_token "$HYPOTHESIS" hypothesis; chk_token "$ACTION" action; chk_token "$RESULT" result
 CTL=0
 if [ -n "$ANSWERS" ]; then
   CTL=1; ensure_state
@@ -233,7 +337,8 @@ if [ -n "$FACTS" ]; then
     case "$f" in *=*) ;; *) fail "fact must be NAME=STATUS" ;; esac
     name="$(printf '%s' "${f%%=*}" | tr 'a-z' 'A-Z')"; stt="$(printf '%s' "${f#*=}" | tr 'a-z' 'A-Z')"
     in_list "$name" "$FACT_NAMES" || fail "fact not allowed: $name"
-    case "$stt" in PASS|OPEN|BLOCKED|NOT_RUN|UNVERIFIED|ACCEPTED_RISK|SKIPPED) ;; *) fail "fact status not allowed: $stt" ;; esac
+    [ "$stt" = "NOT_TESTED" ] && stt="NOT_RUN"
+    case "$stt" in PASS|OPEN|BLOCKED|NOT_RUN|UNVERIFIED|ACCEPTED_RISK|SKIPPED|DEFERRED|NOT_APPLICABLE) ;; *) fail "fact status not allowed: $stt" ;; esac
     if [ "$name" = "TRAINING" ] && [ "$stt" = "PASS" ]; then fail "TRAINING_IS_COMPUTED: training is complete only when all TRAIN_* facts are PASS; a skip is recorded as TRAINING=SKIPPED"; fi
     if { [ "$stt" = "ACCEPTED_RISK" ] || [ "$stt" = "UNVERIFIED" ]; } && [ "$name" != "HOST_IDENTITY" ]; then fail "$stt is allowed only for HOST_IDENTITY"; fi
     if [ "$stt" = "SKIPPED" ]; then in_list "$name" "$TRAIN_NAMES TRAINING" || fail "SKIPPED is allowed only for TRAIN_* and TRAINING"; fi
@@ -243,12 +348,15 @@ if [ -n "$FACTS" ]; then
       if [ "$name" = "HOST_IDENTITY" ] && [ "$ev" = "L" ]; then fail "HOST_IDENTITY PASS needs the person to confirm the independent comparison (evidence U or LU)"; fi
     fi
     if [ "$stt" = "ACCEPTED_RISK" ] && [ "$ev" != "U" ]; then fail "ACCEPTED_RISK is the owner decision: evidence U"; fi
+    if [ "$name" = "RECOVERY" ] && [ "$stt" = "PASS" ]; then
+      case "$SCOPE" in agent_channel|human_only) ;; *) fail "RECOVERY PASS needs --scope agent_channel or human_only: who may use the recovery channel" ;; esac
+    fi
     if [ "$name" = "ADMIN_READY" ] && [ "$stt" = "PASS" ]; then
       { [ "$(get_answer admin_context)" = "agent_channel" ] && [ "$(get_answer admin_sudo_result)" = "ok" ]; } || fail "ADMIN_READY PASS needs the answers admin_context=agent_channel and admin_sudo_result=ok, recorded from a real administrative command in the agent channel"
     fi
     todo="$todo $name=$stt"
   done
-  for t in $todo; do set_fact "${t%%=*}" "${t#*=}" "$ev" "$SOURCE" "$gen"; echo "FACT_SET ${t%%=*} ${t#*=}"; done
+  for t in $todo; do set_fact "${t%%=*}" "${t#*=}" "$ev" "$SOURCE" "$gen" "${SCOPE:--}" "${BLOCKER:--}" "${RETRY:--}"; echo "FACT_SET ${t%%=*} ${t#*=}"; done
 fi
 if [ "$NEWSERVER" -eq 1 ]; then
   CTL=1; ensure_state; ensure_meta
@@ -283,6 +391,79 @@ if [ -n "$RESET" ]; then
   [ "$RESET" -ge 1 ] && [ "$RESET" -le "$STAGE_COUNT" ] || fail "stage must be 1..$STAGE_COUNT"
   set_stage "$RESET" PENDING '?' reset reset
   echo "STAGE_RESET $RESET"
+fi
+if [ -n "$ATTEMPT_CHECK" ]; then
+  CTL=1; ensure_state
+  in_list "$ATTEMPT_CHECK" "$ATTEMPT_AREAS" || fail "area not allowed: $ATTEMPT_CHECK"
+  n="$(attempt_count "$ATTEMPT_CHECK")"
+  if [ "$n" -ge 2 ]; then echo "ATTEMPT_STOP area=$ATTEMPT_CHECK no_new_knowledge=$n next=explain_the_blocker_then_an_independent_check_or_the_support_request"
+  else echo "ATTEMPT_ALLOWED area=$ATTEMPT_CHECK no_new_knowledge=$n"; fi
+fi
+if [ -n "$ATTEMPT" ]; then
+  CTL=1; ensure_state
+  in_list "$ATTEMPT" "$ATTEMPT_AREAS" || fail "area not allowed: $ATTEMPT"
+  [ -n "$SYMPTOM" ] && [ -n "$HYPOTHESIS" ] && [ -n "$ACTION" ] && [ -n "$RESULT" ] || fail "an attempt needs --symptom --hypothesis --action --result (codes)"
+  case "$KNOWLEDGE" in yes|no|pending) ;; *) fail "an attempt needs --knowledge yes|no|pending (pending = polling an operation already started, at most 5 polls in a row)" ;; esac
+  if [ "$KNOWLEDGE" = "pending" ]; then
+    pc="$(pending_count "$ATTEMPT")"
+    [ "$pc" -lt 5 ] || fail "WAIT_LIMIT area=$ATTEMPT polls=$pc: record the outcome (--knowledge yes or no) or the blocker; waiting is not repeated without a limit"
+  else
+    pr="$(pair_count "$HYPOTHESIS" "$ACTION")"
+    [ "$pr" -lt 2 ] || fail "ATTEMPT_REPEAT hypothesis=$HYPOTHESIS action=$ACTION: the same attempt already failed twice without new knowledge; another area name does not make it new; record --change with a real change of conditions"
+  fi
+  n="$(attempt_count "$ATTEMPT")"
+  if [ "$n" -ge 2 ]; then fail "ATTEMPT_STOP area=$ATTEMPT no_new_knowledge=$n: do not repeat; explain the blocker, take an independent check or prepare the support request; record --change when the conditions really changed"; fi
+  attempt_append "$ATTEMPT" attempt "$SYMPTOM" "$HYPOTHESIS" "$ACTION" "$RESULT" "$KNOWLEDGE"
+  n2="$(attempt_count "$ATTEMPT")"
+  if [ "$n2" -ge 2 ]; then echo "ATTEMPT_RECORDED area=$ATTEMPT ATTEMPT_STOP_REACHED no_new_knowledge=$n2"; else echo "ATTEMPT_RECORDED area=$ATTEMPT no_new_knowledge=$n2"; fi
+fi
+if [ -n "$CHANGE" ]; then
+  CTL=1; ensure_state
+  in_list "$CHANGE" "$ATTEMPT_AREAS" || fail "area not allowed: $CHANGE"
+  in_list "$SOURCE" "$CHANGE_KINDS" || fail "a change needs --source from: $CHANGE_KINDS (what really changed)"
+  printf '%s' "$ACTION" | grep -Eq '^[A-Za-z0-9_+-]{3,40}$' || fail "a change needs --action (a code that names the concrete change, for example switch-to-firefox)"
+  cn_="$(attempt_count "$CHANGE")"
+  [ "$cn_" -ge 2 ] || fail "CHANGE_NOT_NEEDED area=$CHANGE: the area is not stopped ($cn_ attempts without new knowledge); a change is recorded to lift a stop, not in advance"
+  seen_ch="$(awk -F'	' -v a="$CHANGE" -v c="$ACTION" 'NF>=9 && $3==a && $4=="change" && $7==c { n++ } END { print n+0 }' "$F_ATT")"
+  [ "$seen_ch" -eq 0 ] || fail "CHANGE_REPEATED area=$CHANGE: this change was already recorded for the area; name what is actually different"
+  attempt_append "$CHANGE" change - - "$ACTION" "$SOURCE" yes
+  echo "CONDITIONS_CHANGED area=$CHANGE kind=$SOURCE change=$ACTION"
+fi
+if [ "$CHECKPOINTS" -eq 1 ]; then
+  CTL=1; ensure_state; ensure_meta
+  for cn in HOST_IDENTITY SSH_AUTH ADMIN_ACCESS RECOVERY; do chk_line "$cn"; done
+fi
+if [ "$CONTEXT" -eq 1 ]; then
+  CTL=1; ensure_state; ensure_meta
+  cv=""; [ -f "$KIT_ROOT/VERSION" ] && cv="$(tr -d '\r\n ' < "$KIT_ROOT/VERSION")"
+  case "$(lower "$(uname -s 2>/dev/null || echo unknown)")" in darwin) cos="macos" ;; linux) cos="linux" ;; mingw*|msys*|cygwin*) cos="windows-shell" ;; *) cos="other" ;; esac
+  cp_="$(get_answer exec_place)"
+  if [ -z "$cp_" ]; then if [ -n "${SSH_CONNECTION:-}" ]; then cp_="remote_linux_hint"; else cp_="unproven"; fi; fi
+  cw="local"; case "$cp_" in remote_linux|remote_linux_hint) cw="remote" ;; unproven) cw="unknown" ;; esac
+  tsh="not_found"; command -v ssh >/dev/null 2>&1 && tsh="found"; tcd="not_found"; command -v code >/dev/null 2>&1 && tcd="found"
+  echo "CONTEXT kit_version=$cv script_version=$KIT_VERSION os=$cos place=$cp_ window=$cw generation=$(meta_get generation) tools_ssh=$tsh tools_code=$tcd unfinished=$(unfinished_ops)"
+  echo "CONTEXT note: the version is that of THIS folder; a local copy and a remote copy are separate installations"
+fi
+if [ "$EXPORT" -eq 1 ]; then
+  CTL=1; ensure_state; ensure_meta; init_stages
+  xv=""; [ -f "$KIT_ROOT/VERSION" ] && xv="$(tr -d '\r\n ' < "$KIT_ROOT/VERSION")"
+  case "$(lower "$(uname -s 2>/dev/null || echo unknown)")" in darwin) xos="macos" ;; linux) xos="linux" ;; mingw*|msys*|cygwin*) xos="windows-shell" ;; *) xos="other" ;; esac
+  pt="$(get_answer provider_type)"; [ -n "$pt" ] || pt="unknown"
+  case "$pt" in api_available|api_limited|api_not_found|api_not_checked|panel_only|unknown) ;; *) rm -f "$F_EXPORT"; fail "EXPORT_REFUSED: provider_type is not one of the closed values; nothing was written" 3 ;; esac
+  cps=""; for cn in HOST_IDENTITY SSH_AUTH ADMIN_ACCESS RECOVERY; do cps="$cps $cn=$(chk_status "$cn")"; done
+  sts=""; i=1; while [ "$i" -le "$STAGE_COUNT" ]; do sts="$sts $i:$(stage_status "$i")"; i=$((i + 1)); done
+  tot=0; [ -f "$F_ATT" ] && tot="$(wc -l < "$F_ATT" | tr -d ' ')"
+  stp=""; for ar in $ATTEMPT_AREAS; do [ "$(attempt_count "$ar")" -ge 2 ] && stp="$stp${stp:+,}$ar"; done; [ -n "$stp" ] || stp="none"
+  { echo "EXPORT kit=$xv os=$xos generation=$(meta_get generation) provider_type=$pt"
+    echo "EXPORT checkpoints$cps"
+    echo "EXPORT stages$sts"
+    echo "EXPORT attempts total=$tot stopped=$stp"
+    echo "EXPORT unfinished $(unfinished_ops)"
+    echo "EXPORT note: nothing is sent automatically (network sending is off and there is no receiver); this is a local file for manual transfer; it holds no address, user name, password, key, console output or project content"; } > "$F_EXPORT.tmp"
+  # the note names the forbidden classes in words, so the gate runs on every line except the note
+  grep -v '^EXPORT note:' "$F_EXPORT.tmp" > "$F_EXPORT.chk"
+  if export_gate "$F_EXPORT.chk"; then mv "$F_EXPORT.tmp" "$F_EXPORT"; rm -f "$F_EXPORT.chk"; cat "$F_EXPORT"
+  else rm -f "$F_EXPORT.tmp" "$F_EXPORT.chk" "$F_EXPORT"; fail "EXPORT_REFUSED: a field looks like an address, host name, path, mail or secret; nothing was written (inspect the answers and state codes)" 3; fi
 fi
 [ "$CTL" -eq 1 ] && exit 0
 
@@ -326,6 +507,17 @@ if [ "$SUMMARY" -eq 1 ]; then
     cta="hidden"; offer_ready && cta="ready"
     echo "SUMMARY OFFER eligible branch=$br cta=$cta ($OFFER_REASON)"
   else echo "SUMMARY OFFER not_eligible reason=result_or_training_not_done"; fi
+  cps2=""; for cn in HOST_IDENTITY SSH_AUTH ADMIN_ACCESS RECOVERY; do cps2="$cps2 $cn=$(chk_status "$cn")"; done
+  echo "SUMMARY CHECKPOINTS$cps2"
+  dfr=""; nap=""
+  if [ -f "$F_FACTS" ]; then
+    dfr="$(awk -F'\t' '$2=="DEFERRED"{printf "%s%s", (n++?",":""), $1}' "$F_FACTS")"
+    nap="$(awk -F'\t' '$2=="NOT_APPLICABLE"{printf "%s%s", (n++?",":""), $1}' "$F_FACTS")"
+  fi
+  [ -z "$dfr" ] || echo "SUMMARY DEFERRED $dfr"
+  [ -z "$nap" ] || echo "SUMMARY NOT_APPLICABLE $nap"
+  stpa=""; for ar in $ATTEMPT_AREAS; do [ "$(attempt_count "$ar")" -ge 2 ] && stpa="$stpa${stpa:+,}$ar"; done
+  [ -z "$stpa" ] || echo "SUMMARY ATTEMPTS stopped=$stpa (explain the blocker, take an independent check or prepare the support request)"
   echo "SUMMARY GENERATION $(meta_get generation)"
   exit 0
 fi

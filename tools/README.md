@@ -16,6 +16,24 @@
 
 `code` не найден в PATH даёт `UNKNOWN`, а не `FAIL`: VS Code может быть установлен без команды `code`. Для macOS в VS Code есть команда «Shell Command: Install 'code' command in PATH».
 
+## Контрольные точки, попытки, контекст, экспорт
+
+| Windows | macOS/Linux | Что делает |
+|---|---|---|
+| `-Checkpoints` | `--checkpoints` | HOST_IDENTITY, SSH_AUTH, ADMIN_ACCESS, RECOVERY по записанным фактам (совместимо со старыми KEY_LOGIN и ADMIN_READY) |
+| `-Fact X=S -Scope S -Blocker B -Retry R` | `--fact X=S --scope S --blocker B --retry R` | факт с областью, блокером и условием повтора (коды без адресов); RECOVERY=PASS требует область `agent_channel` или `human_only` |
+| `-Attempt AREA -Symptom -Hypothesis -Action -Result -Knowledge yes/no/pending` | `--attempt AREA --symptom ...` | запись в `state/attempts.tsv`; после двух подряд без нового знания следующая попытка отказывается (код 2); та же гипотеза и действие под другим названием области считаются той же попыткой; `pending` — опрос уже запущенной операции, не более 5 подряд |
+| `-AttemptCheck AREA` | `--attempt-check AREA` | `OK` или `STOP` по области |
+| `-Change AREA -Source KIND -Action CODE` | `--change AREA --source KIND --action CODE` | записать конкретное изменение условий (KIND из закрытого списка: other_device, other_browser, other_network, other_account, corrected_parameter, new_fact, new_candidate, provider_reply, new_generation, new_tool, owner_decision) и снять остановку; принимается только для остановленной области и не дважды подряд |
+| `-Context` | `--context` | версия установки, окно, папка, сервер, инструменты, незавершённые операции |
+| `-Export` | `--export` | `state/export.txt` для ручной передачи; ничего не отправляется автоматически |
+
+Статусы фактов дополнены `DEFERRED` (отложено решением) и `NOT_APPLICABLE` (не относится к пути); `NOT_TESTED` читается как `NOT_RUN`, старые записи не переименовываются. Области попыток: HOST_IDENTITY, SSH_AUTH, ADMIN_ACCESS, RECOVERY, CONSOLE, PANEL, PROVIDER_API, ENGINE, PERMISSION, TUNNEL, MIGRATION, OTHER.
+
+## Помощник провайдера (отдельный файл)
+
+**Experimental, на настоящем API не проверен.** `tools/provider-api.ps1` / `tools/provider-api.sh`: фиксированные операции с API провайдера, ключ в хранилище ОС, очищенный вывод, покупка только через предпросмотр и код подтверждения. Полное описание, границы и что проверено — `procedures/provider-api.md`.
+
 ## Ответы человека (`-Answer` / `--answer`)
 
 Принимаются только значения из белого списка; произвольный текст и секреты не принимаются.

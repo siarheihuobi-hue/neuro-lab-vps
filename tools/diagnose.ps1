@@ -1,6 +1,6 @@
 <#
  diagnose.ps1 - read-only start diagnostics for the VPS workshop kit (Windows branch).
- Kit 0.2.0-preview.
+ Kit 0.3.0-preview.
  ASCII only on purpose: Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI.
  It never changes the system, network, VPN, SSH, keys or settings. It writes only under <kit>\state\.
 
@@ -15,6 +15,12 @@
    powershell -NoProfile -File tools\diagnose.ps1 -NewServer -Source owner-message   (a NEW server: new generation, old server facts do not carry over)
    powershell -NoProfile -File tools\diagnose.ps1 -Migrate    (idempotent state migration to schema 2; also done on a normal run)
    powershell -NoProfile -File tools\diagnose.ps1 -Summary    (five separate results: workspace, app, reconnect, security, training)
+   powershell -NoProfile -File tools\diagnose.ps1 -Checkpoints    (the four access checkpoints with status, source, scope, blocker, retry condition)
+   powershell -NoProfile -File tools\diagnose.ps1 -Attempt CONSOLE -Symptom no-paste -Hypothesis focus -Action click-field -Result same -Knowledge no   (attempt log)
+   powershell -NoProfile -File tools\diagnose.ps1 -AttemptCheck CONSOLE    (ALLOWED or STOP after two attempts without new knowledge)
+   powershell -NoProfile -File tools\diagnose.ps1 -Change CONSOLE -Source other_browser -Action switch-to-firefox    (a concrete change of conditions; only for a stopped area)
+   powershell -NoProfile -File tools\diagnose.ps1 -Context    (version of THIS installation, OS, window, generation, tools)
+   powershell -NoProfile -File tools\diagnose.ps1 -Export     (safe local export for MANUAL transfer; nothing is sent)
 
 #>
 [CmdletBinding()]
@@ -30,11 +36,25 @@ param(
   [switch]$NewServer,
   [switch]$Migrate,
   [switch]$Summary,
+  [switch]$Checkpoints,
+  [switch]$Context,
+  [switch]$Export,
+  [string]$Scope = '',
+  [string]$Blocker = '',
+  [string]$Retry = '',
+  [string]$Attempt = '',
+  [string]$AttemptCheck = '',
+  [string]$Change = '',
+  [string]$Symptom = '',
+  [string]$Hypothesis = '',
+  [string]$Action = '',
+  [string]$Result = '',
+  [string]$Knowledge = '',
   [switch]$Report
 )
 
 $ErrorActionPreference = 'Continue'
-$KitVersion = '0.2.0-preview'
+$KitVersion = '0.3.0-preview'
 $KitRoot  = Split-Path -Parent $PSScriptRoot
 $StateDir = Join-Path $KitRoot 'state'
 $TelDir   = Join-Path $StateDir 'telemetry'
@@ -115,6 +135,7 @@ $AllowedAnswers = @{
   'region_state'        = @('available', 'unavailable', 'unknown');
   'panel_access'        = @('ok', 'unreachable_via_vpn', 'other');
   'cheat_sheet_local'   = @('yes', 'no');
+  'provider_type'       = @('api_available', 'api_limited', 'api_not_found', 'api_not_checked', 'panel_only', 'unknown');
   'admin_sudo_actor'    = @('working_ssh_user', 'other_account', 'untested');
   'admin_sudo_result'   = @('ok', 'auth_failed', 'no_sudo_rights', 'no_interactive_input', 'agent_context_unavailable', 'other', 'untested');
   'admin_candidate'     = @('none', 'current_user_in_sudo_group', 'other_account_in_sudo_group', 'unknown');
@@ -138,11 +159,100 @@ function Save-Answers($h) {
 
 # ---------- state schema 2: finer facts, server generation ----------
 # facts.tsv: fact, status, label, source, date, generation.  meta.tsv: schema, target_id, generation, created, migrated_from.
-$FactNames = @('SERVER_PURCHASED', 'SERVER_ACTIVE', 'HOST_IDENTITY', 'KEY_READY', 'KEY_INSTALLED', 'KEY_LOGIN', 'PREFLIGHT', 'ADMIN_READY', 'UFW', 'SSH_HARDENING',
+$FactNames = @('SERVER_PURCHASED', 'SERVER_ACTIVE', 'HOST_IDENTITY', 'KEY_READY', 'KEY_INSTALLED', 'KEY_LOGIN', 'SSH_AUTH', 'PREFLIGHT', 'ADMIN_READY', 'RECOVERY', 'UFW', 'SSH_HARDENING',
                'ENGINE_READY', 'TEAM_LOADED', 'QA', 'APP_BROWSER', 'RECONNECT',
                'TRAIN_REMOTE_WINDOW', 'TRAIN_OPEN_PROJECT', 'TRAIN_NEW_PROJECT', 'TRAIN_SESSION', 'TRAIN_TASK', 'TRAIN_PORTS', 'TRAIN_DISK', 'TRAIN_RESUME', 'TRAINING')
 $TrainNames = @('TRAIN_REMOTE_WINDOW', 'TRAIN_OPEN_PROJECT', 'TRAIN_NEW_PROJECT', 'TRAIN_SESSION', 'TRAIN_TASK', 'TRAIN_PORTS', 'TRAIN_DISK', 'TRAIN_RESUME')
-$FactStatuses = @('PASS', 'OPEN', 'BLOCKED', 'NOT_RUN', 'UNVERIFIED', 'ACCEPTED_RISK', 'SKIPPED')
+$FactStatuses = @('PASS', 'OPEN', 'BLOCKED', 'NOT_RUN', 'UNVERIFIED', 'ACCEPTED_RISK', 'SKIPPED', 'DEFERRED', 'NOT_APPLICABLE')
+$AttemptAreas = @('HOST_IDENTITY', 'SSH_AUTH', 'ADMIN_ACCESS', 'RECOVERY', 'CONSOLE', 'PANEL', 'PROVIDER_API', 'ENGINE', 'PERMISSION', 'TUNNEL', 'MIGRATION', 'OTHER')
+$FAttempts = Join-Path $StateDir 'attempts.tsv'
+$FExport = Join-Path $StateDir 'export.txt'
+function Chk-Token([string]$v, [string]$what) {
+  if ($v -and ($v -notmatch '^[A-Za-z0-9_.+-]{1,40}$')) { Fail ($what + ' must match A-Za-z0-9_.+- (1-40 chars; codes only, no free text, no secrets)') 2 }
+  if ($v -and ($v -match '[A-Za-z0-9-]+[.][A-Za-z]{2,}')) { Fail ($what + ' must not look like a host name (codes only)') 2 }
+}
+# trailing attempts of an area without new knowledge since the last recorded change of conditions
+function Attempt-Count([string]$area) {
+  $n = 0
+  foreach ($l in (Read-Lines $FAttempts)) {
+    $p = $l -split "`t"
+    if (($p.Count -lt 9) -or ($p[2] -ne $area)) { continue }
+    if ($p[3] -eq 'change') { $n = 0 }
+    elseif ($p[3] -eq 'attempt') { if ($p[8] -eq 'no') { $n++ } elseif ($p[8] -eq 'yes') { $n = 0 } }
+  }
+  return $n
+}
+# consecutive polls of an already started asynchronous operation (knowledge=pending); bounded, a result or a change resets
+function Pending-Count([string]$area) {
+  $n = 0
+  foreach ($l in (Read-Lines $FAttempts)) {
+    $p = $l -split "`t"
+    if (($p.Count -lt 9) -or ($p[2] -ne $area)) { continue }
+    if ($p[3] -eq 'change') { $n = 0 }
+    elseif ($p[3] -eq 'attempt') { if ($p[8] -eq 'pending') { $n++ } else { $n = 0 } }
+  }
+  return $n
+}
+# the same hypothesis+action without new knowledge, whatever the area is called; cleared by a change in the area where it began
+function Pair-Count([string]$hy, [string]$ac) {
+  $cnt = @{}; $org = @{}
+  foreach ($l in (Read-Lines $FAttempts)) {
+    $p = $l -split "`t"
+    if ($p.Count -lt 9) { continue }
+    $k = $p[5] + '|' + $p[6]
+    if ($p[3] -eq 'change') {
+      foreach ($q in @($org.Keys)) { if ($org[$q] -eq $p[2]) { $cnt.Remove($q); $org.Remove($q) } }
+    } elseif ($p[3] -eq 'attempt') {
+      if ($p[8] -eq 'no') { if (-not $org.ContainsKey($k)) { $org[$k] = $p[2]; $cnt[$k] = 0 }; $cnt[$k] = $cnt[$k] + 1 }
+      elseif ($p[8] -eq 'yes') { $cnt.Remove($k); $org.Remove($k) }
+    }
+  }
+  $key = $hy + '|' + $ac
+  if ($cnt.ContainsKey($key)) { return $cnt[$key] } else { return 0 }
+}
+$ChangeKinds = @('other_device', 'other_browser', 'other_network', 'other_account', 'corrected_parameter', 'new_fact', 'new_candidate', 'provider_reply', 'new_generation', 'new_tool', 'owner_decision')
+# unfinished operations: fact names that are OPEN/BLOCKED/DEFERRED and stopped areas (codes only)
+function Unfinished-Ops($facts) {
+  $u = @()
+  foreach ($k in ($facts.Keys | Sort-Object)) { $st = $facts[$k][1]; if (@('OPEN', 'BLOCKED', 'DEFERRED') -contains $st) { $u += ($k + '=' + $st) } }
+  foreach ($ar in $AttemptAreas) { if ((Attempt-Count $ar) -ge 2) { $u += ('STOPPED_' + $ar) } }
+  if ($u.Count -eq 0) { return 'none' }
+  return ($u -join ',')
+}
+# last gate before a file leaves the state folder: nothing that looks like an address, host name, mail, path, URL, long hex/base64 or key block
+function Export-Gate([string[]]$lines) {
+  $rx = '(^|[^0-9])[0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}($|[^0-9])|[A-Za-z0-9-]+[.][A-Za-z]{2,}([^A-Za-z]|$)|@|[/\\]|://|[0-9a-f]{16,}|[A-Za-z0-9+]{32,}|([0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f]{1,4}|PRIVATE KEY|passw[o]rd=|toke[n]='
+  foreach ($l in $lines) { if ($l -match $rx) { return $false } }
+  return $true
+}
+function Attempt-Append([string]$area, [string]$kind, [string]$sy, [string]$hy, [string]$ac, [string]$re, [string]$kn) {
+  $c = @(Read-Lines $FAttempts).Count + 1
+  Append-Line $FAttempts (([string]$c) + $Tab + (NowUtc) + $Tab + $area + $Tab + $kind + $Tab + $sy + $Tab + $hy + $Tab + $ac + $Tab + $re + $Tab + $kn)
+}
+# the four independent access checkpoints; old fact names are kept and mapped, not renamed
+function Chk-Line([string]$name, $facts) {
+  $row = $null; $via = $name
+  if ($name -eq 'SSH_AUTH') {
+    if ($facts.ContainsKey('SSH_AUTH')) { $row = $facts['SSH_AUTH'] } elseif ($facts.ContainsKey('KEY_LOGIN')) { $row = $facts['KEY_LOGIN']; $via = 'KEY_LOGIN(compat)' }
+  } elseif ($name -eq 'ADMIN_ACCESS') {
+    if ($facts.ContainsKey('ADMIN_READY')) { $row = $facts['ADMIN_READY']; $via = 'ADMIN_READY(compat)' }
+  } elseif ($facts.ContainsKey($name)) { $row = $facts[$name] }
+  if ($row) {
+    $g = (Load-Meta)['generation']
+    if (($row.Count -ge 6) -and $g -and $row[5] -and ($row[5] -ne $g)) { $via = $via + '(stale_generation_ignored)'; $row = $null }
+    elseif (($via -like '*(compat)') -and ($row[2] -notmatch 'L')) { $via = $via + '(needs_local_evidence_ignored)'; $row = $null }
+  }
+  $purpose = @{ HOST_IDENTITY = 'host_key_belongs_to_the_target_server'; SSH_AUTH = 'user_login_by_password_or_client_key'; ADMIN_ACCESS = 'confirmed_user_can_do_administrative_actions'; RECOVERY = 'verified_backup_channel_and_who_may_use_it' }
+  $st = 'NOT_RUN'; $src = '-'; $dt = '-'; $sc = '-'; $bl = '-'; $rt = '-'
+  if ($row) {
+    $st = $row[1]; $src = $row[3]; $dt = $row[4]
+    if ($row.Count -ge 9) { $sc = $row[6]; $bl = $row[7]; $rt = $row[8] }
+  }
+  $exr = ''
+  if ($name -eq 'RECOVERY') { $arb = 'no'; if (($st -eq 'PASS') -and ($sc -eq 'agent_channel')) { $arb = 'yes' }; $exr = ' agent_can_rollback=' + $arb }
+  return @{ Status = $st; Line = ('CHECKPOINT ' + $name + ' status=' + $st + ' purpose=' + $purpose[$name] + ' source=' + $src + ' date=' + $dt + ' scope=' + $sc + ' blocker=' + $bl + ' retry=' + $rt + ' via=' + $via + $exr) }
+}
+
 $LocalEvidenceFacts = @('KEY_LOGIN', 'ADMIN_READY', 'UFW', 'SSH_HARDENING')
 $StageNeeds = @{
   3 = @('SERVER_PURCHASED', 'SERVER_ACTIVE'); 4 = @('HOST_IDENTITY', 'KEY_READY', 'KEY_INSTALLED', 'KEY_LOGIN'); 5 = @('PREFLIGHT');
@@ -292,6 +402,10 @@ function Get-Status([string]$id) {
 foreach ($tok in @($Source, $Note)) {
   if ($tok -match '(^|[^0-9])[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}($|[^0-9])') { Fail 'source and note must not look like an IP address' 2 }
 }
+foreach ($tok in @($Scope, $Blocker, $Retry, $Symptom, $Hypothesis, $Action, $Result, $Knowledge)) {
+  if ($tok -match '(^|[^0-9])[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}($|[^0-9])') { Fail 'codes must not look like an IP address' 2 }
+}
+Chk-Token $Source 'source'; Chk-Token $Scope 'scope'; Chk-Token $Blocker 'blocker'; Chk-Token $Retry 'retry'; Chk-Token $Symptom 'symptom'; Chk-Token $Hypothesis 'hypothesis'; Chk-Token $Action 'action'; Chk-Token $Result 'result'
 $ctl = $false
 if ($Answer.Count -gt 0) {
   $ctl = $true
@@ -356,6 +470,7 @@ if ($Fact.Count -gt 0) {
     if ($i -lt 1) { Fail 'fact must be NAME=STATUS' 2 }
     $name = $f.Substring(0, $i).Trim().ToUpper()
     $stt = $f.Substring($i + 1).Trim().ToUpper()
+    if ($stt -eq 'NOT_TESTED') { $stt = 'NOT_RUN' }
     if ($FactNames -notcontains $name) { Fail ('fact not allowed: ' + $name) 2 }
     if ($FactStatuses -notcontains $stt) { Fail ('fact status not allowed: ' + $stt) 2 }
     if ($name -eq 'TRAINING' -and $stt -eq 'PASS') { Fail 'TRAINING_IS_COMPUTED: training is complete only when all TRAIN_* facts are PASS; a skip is recorded as TRAINING=SKIPPED' 2 }
@@ -367,13 +482,15 @@ if ($Fact.Count -gt 0) {
       if ($name -eq 'HOST_IDENTITY' -and $ev -eq 'L') { Fail 'HOST_IDENTITY PASS needs the person to confirm the independent comparison (evidence U or LU)' 2 }
     }
     if ($stt -eq 'ACCEPTED_RISK' -and $ev -ne 'U') { Fail 'ACCEPTED_RISK is the owner decision: evidence U' 2 }
+    if ($name -eq 'RECOVERY' -and $stt -eq 'PASS' -and (@('agent_channel', 'human_only') -notcontains $Scope)) { Fail 'RECOVERY PASS needs -Scope agent_channel or human_only: who may use the recovery channel' 2 }
     if ($name -eq 'ADMIN_READY' -and $stt -eq 'PASS') {
       $aa = Load-Answers
       if (($aa['admin_context'] -ne 'agent_channel') -or ($aa['admin_sudo_result'] -ne 'ok')) { Fail 'ADMIN_READY PASS needs the answers admin_context=agent_channel and admin_sudo_result=ok, recorded from a real administrative command in the agent channel' 2 }
     }
     $todo += ,@($name, $stt)
   }
-  foreach ($t in $todo) { $facts[$t[0]] = @($t[0], $t[1], $ev, $Source, (NowUtc), $gen) }
+  $xs = '-'; if ($Scope) { $xs = $Scope }; $xb = '-'; if ($Blocker) { $xb = $Blocker }; $xr = '-'; if ($Retry) { $xr = $Retry }
+  foreach ($t in $todo) { $facts[$t[0]] = @($t[0], $t[1], $ev, $Source, (NowUtc), $gen, $xs, $xb, $xr) }
   Save-Facts $facts
   foreach ($t in $todo) { Write-Host ('FACT_SET ' + $t[0] + ' ' + $t[1]) }
 }
@@ -408,6 +525,92 @@ if ($Migrate) {
   $ctl = $true
   $did = Ensure-Meta
   if ($did) { Write-Host 'STATE_MIGRATED schema=2' } else { Write-Host 'STATE_ALREADY_CURRENT schema=2' }
+}
+if ($AttemptCheck) {
+  $ctl = $true
+  if ($AttemptAreas -notcontains $AttemptCheck) { Fail ('area not allowed: ' + $AttemptCheck) 2 }
+  $n = Attempt-Count $AttemptCheck
+  if ($n -ge 2) { Write-Host ('ATTEMPT_STOP area=' + $AttemptCheck + ' no_new_knowledge=' + $n + ' next=explain_the_blocker_then_an_independent_check_or_the_support_request') }
+  else { Write-Host ('ATTEMPT_ALLOWED area=' + $AttemptCheck + ' no_new_knowledge=' + $n) }
+}
+if ($Attempt) {
+  $ctl = $true
+  if ($AttemptAreas -notcontains $Attempt) { Fail ('area not allowed: ' + $Attempt) 2 }
+  if (-not ($Symptom -and $Hypothesis -and $Action -and $Result)) { Fail 'an attempt needs -Symptom -Hypothesis -Action -Result (codes)' 2 }
+  if (@('yes', 'no', 'pending') -notcontains $Knowledge) { Fail 'an attempt needs -Knowledge yes|no|pending (pending = polling an operation already started, at most 5 polls in a row)' 2 }
+  if ($Knowledge -eq 'pending') {
+    $pc = Pending-Count $Attempt
+    if ($pc -ge 5) { Fail ('WAIT_LIMIT area=' + $Attempt + ' polls=' + $pc + ': record the outcome (-Knowledge yes or no) or the blocker; waiting is not repeated without a limit') 2 }
+  } else {
+    $pr = Pair-Count $Hypothesis $Action
+    if ($pr -ge 2) { Fail ('ATTEMPT_REPEAT hypothesis=' + $Hypothesis + ' action=' + $Action + ': the same attempt already failed twice without new knowledge; another area name does not make it new; record -Change with a real change of conditions') 2 }
+  }
+  $n = Attempt-Count $Attempt
+  if ($n -ge 2) { Fail ('ATTEMPT_STOP area=' + $Attempt + ' no_new_knowledge=' + $n + ': do not repeat; explain the blocker, take an independent check or prepare the support request; record -Change when the conditions really changed') 2 }
+  Attempt-Append $Attempt 'attempt' $Symptom $Hypothesis $Action $Result $Knowledge
+  $n2 = Attempt-Count $Attempt
+  if ($n2 -ge 2) { Write-Host ('ATTEMPT_RECORDED area=' + $Attempt + ' ATTEMPT_STOP_REACHED no_new_knowledge=' + $n2) } else { Write-Host ('ATTEMPT_RECORDED area=' + $Attempt + ' no_new_knowledge=' + $n2) }
+}
+if ($Change) {
+  $ctl = $true
+  if ($AttemptAreas -notcontains $Change) { Fail ('area not allowed: ' + $Change) 2 }
+  if ($ChangeKinds -notcontains $Source) { Fail ('a change needs -Source from: ' + ($ChangeKinds -join ' ') + ' (what really changed)') 2 }
+  if ($Action -notmatch '^[A-Za-z0-9_+-]{3,40}$') { Fail 'a change needs -Action (a code that names the concrete change, for example switch-to-firefox)' 2 }
+  $cn = Attempt-Count $Change
+  if ($cn -lt 2) { Fail ('CHANGE_NOT_NEEDED area=' + $Change + ': the area is not stopped (' + $cn + ' attempts without new knowledge); a change is recorded to lift a stop, not in advance') 2 }
+  $seenCh = 0
+  foreach ($l in (Read-Lines $FAttempts)) {
+    $p = $l -split "`t"
+    if (($p.Count -ge 9) -and ($p[2] -eq $Change) -and ($p[3] -eq 'change') -and ($p[6] -eq $Action)) { $seenCh++ }
+  }
+  if ($seenCh -gt 0) { Fail ('CHANGE_REPEATED area=' + $Change + ': this change was already recorded for the area; name what is actually different') 2 }
+  Attempt-Append $Change 'change' '-' '-' $Action $Source 'yes'
+  Write-Host ('CONDITIONS_CHANGED area=' + $Change + ' kind=' + $Source + ' change=' + $Action)
+}
+if ($Checkpoints) {
+  $ctl = $true
+  [void](Ensure-Meta)
+  $cf = Load-Facts
+  foreach ($cn in @('HOST_IDENTITY', 'SSH_AUTH', 'ADMIN_ACCESS', 'RECOVERY')) { Write-Host ((Chk-Line $cn $cf).Line) }
+}
+if ($Context) {
+  $ctl = $true
+  [void](Ensure-Meta)
+  $cv = ''; $cvf = Join-Path $KitRoot 'VERSION'
+  if (Test-Path -LiteralPath $cvf) { $cv = ([System.IO.File]::ReadAllText($cvf, $Utf8)).Trim() }
+  $ca = Load-Answers
+  $cp = 'laptop_windows'; if ($ca.ContainsKey('exec_place')) { $cp = $ca['exec_place'] }
+  $cw = 'local'; if ($cp -eq 'remote_linux') { $cw = 'remote' }
+  $tsh = 'not_found'; if (Get-Command ssh -ErrorAction SilentlyContinue) { $tsh = 'found' }
+  $tcd = 'not_found'; if (Get-Command code -ErrorAction SilentlyContinue) { $tcd = 'found' }
+  Write-Host ('CONTEXT kit_version=' + $cv + ' script_version=' + $KitVersion + ' os=windows place=' + $cp + ' window=' + $cw + ' generation=' + (Load-Meta)['generation'] + ' tools_ssh=' + $tsh + ' tools_code=' + $tcd + ' unfinished=' + (Unfinished-Ops (Load-Facts)))
+  Write-Host 'CONTEXT note: the version is that of THIS folder; a local copy and a remote copy are separate installations'
+}
+if ($Export) {
+  $ctl = $true
+  [void](Ensure-Meta)
+  $ex = @()
+  $xv = ''; $xvf = Join-Path $KitRoot 'VERSION'
+  if (Test-Path -LiteralPath $xvf) { $xv = ([System.IO.File]::ReadAllText($xvf, $Utf8)).Trim() }
+  $xa = Load-Answers; $xf = Load-Facts; $xst = Load-Stages
+  $pt = 'unknown'; if ($xa.ContainsKey('provider_type')) { $pt = $xa['provider_type'] }
+  if (@('api_available', 'api_limited', 'api_not_found', 'api_not_checked', 'panel_only', 'unknown') -notcontains $pt) { if (Test-Path -LiteralPath $FExport) { Remove-Item -LiteralPath $FExport -Force }; Fail 'EXPORT_REFUSED: provider_type is not one of the closed values; nothing was written' 3 }
+  $ex += ('EXPORT kit=' + $xv + ' os=windows generation=' + (Load-Meta)['generation'] + ' provider_type=' + $pt)
+  $cps = @(); foreach ($cn in @('HOST_IDENTITY', 'SSH_AUTH', 'ADMIN_ACCESS', 'RECOVERY')) { $cps += ($cn + '=' + (Chk-Line $cn $xf).Status) }
+  $ex += ('EXPORT checkpoints ' + ($cps -join ' '))
+  $sts = @(); for ($i = 1; $i -le $StageCount; $i++) { $sts += ([string]$i + ':' + $xst[$i][1]) }
+  $ex += ('EXPORT stages ' + ($sts -join ' '))
+  $tot = @(Read-Lines $FAttempts).Count; $stp = @(); foreach ($ar in $AttemptAreas) { if ((Attempt-Count $ar) -ge 2) { $stp += $ar } }
+  $stpv = 'none'; if ($stp.Count -gt 0) { $stpv = ($stp -join ',') }
+  $ex += ('EXPORT attempts total=' + $tot + ' stopped=' + $stpv)
+  $ex += ('EXPORT unfinished ' + (Unfinished-Ops $xf))
+  if (-not (Export-Gate $ex)) {
+    if (Test-Path -LiteralPath $FExport) { Remove-Item -LiteralPath $FExport -Force }
+    Fail 'EXPORT_REFUSED: a field looks like an address, host name, path, mail or secret; nothing was written (inspect the answers and state codes)' 3
+  }
+  $ex += 'EXPORT note: nothing is sent automatically (network sending is off and there is no receiver); this is a local file for manual transfer; it holds no address, user name, password, key, console output or project content'
+  Write-Lines $FExport $ex
+  foreach ($e in $ex) { Write-Host $e }
 }
 if ($Reset -ne 0) {
   $ctl = $true
@@ -462,6 +665,14 @@ if ($Summary) {
     $cta = 'hidden'; if ($oc.Ready) { $cta = 'ready' }
     Write-Host ('SUMMARY OFFER eligible branch=' + $br + ' cta=' + $cta + ' (' + $oc.Reason + ')')
   } else { Write-Host 'SUMMARY OFFER not_eligible reason=result_or_training_not_done' }
+  $cps2 = @(); foreach ($cn in @('HOST_IDENTITY', 'SSH_AUTH', 'ADMIN_ACCESS', 'RECOVERY')) { $cps2 += ($cn + '=' + (Chk-Line $cn $facts).Status) }
+  Write-Host ('SUMMARY CHECKPOINTS ' + ($cps2 -join ' '))
+  $dfr = @(); $nap = @()
+  foreach ($k in $FactNames) { if ($facts.ContainsKey($k)) { if ($facts[$k][1] -eq 'DEFERRED') { $dfr += $k } elseif ($facts[$k][1] -eq 'NOT_APPLICABLE') { $nap += $k } } }
+  if ($dfr.Count -gt 0) { Write-Host ('SUMMARY DEFERRED ' + ($dfr -join ',')) }
+  if ($nap.Count -gt 0) { Write-Host ('SUMMARY NOT_APPLICABLE ' + ($nap -join ',')) }
+  $stpa = @(); foreach ($ar in $AttemptAreas) { if ((Attempt-Count $ar) -ge 2) { $stpa += $ar } }
+  if ($stpa.Count -gt 0) { Write-Host ('SUMMARY ATTEMPTS stopped=' + ($stpa -join ',') + ' (explain the blocker, take an independent check or prepare the support request)') }
   Write-Host ('SUMMARY GENERATION ' + (Load-Meta)['generation'])
   exit 0
 }

@@ -1,6 +1,6 @@
 # BOOTSTRAP: единый вход для нейрокоманды
 
-Версия выпуска: `0.2.0-preview` (предварительная: реальные macOS и Linux и полный независимый маршрут не проверены). Выпуск закреплён тегом `v0.2.0-preview` в `https://github.com/siarheihuobi-hue/neuro-lab-vps`. Если выпуск ещё не опубликован, блок установки остановится с сообщением `RELEASE_NOT_FOUND` и ничего не установит.
+Версия выпуска: `0.3.0-preview` (предварительная: реальные macOS и Linux и полный независимый маршрут не проверены). Выпуск закреплён тегом `v0.3.0-preview` в `https://github.com/siarheihuobi-hue/neuro-lab-vps`. Если выпуск ещё не опубликован, блок установки остановится с сообщением `RELEASE_NOT_FOUND` и ничего не установит.
 
 Участник **один раз** отдаёт этот файл своей нейрокоманде (ссылкой на файл выпуска или вставленным текстом). Файл работает **до** получения комплекта и не требует ChatGPT-посредника.
 
@@ -183,7 +183,7 @@ echo "PROJECT_RESULT count=$(printf '%s\n' "$OUT" | grep -c '^PROJECT_CANDIDATE'
 
 ## Шаг 3. Решение о папке
 Пути показываются **только владельцу** и в `state/` не записываются.
-1. **Блок A нашёл ровно один комплект версии `0.2.0-preview`** → сообщи владельцу и продолжай в нём (ничего не скачивай и не перезаписывай). Если он вне текущего workspace, попроси открыть эту папку в VS Code (File → Open Folder), запустить движок там и повторить фразу участника.
+1. **Блок A нашёл ровно один комплект версии `0.3.0-preview`** → сообщи владельцу и продолжай в нём (ничего не скачивай и не перезаписывай). Если он вне текущего workspace, попроси открыть эту папку в VS Code (File → Open Folder), запустить движок там и повторить фразу участника.
 2. **Блок A нашёл один комплект другой версии** → не обновляй молча: спроси владельца (обновление — отдельное решение) и предложи процедуру из раздела «Обновление» ниже: резервная копия, проверка новой версии, миграция состояния, возможность отката. Состояние, проекты и ключи при этом не затираются.
 3. **Блок A нашёл несколько комплектов** → задай **один вопрос**: какую папку использовать (варианты с версией и признаком `state`).
 4. **Комплекта нет, блок B нашёл ровно один VPS-проект** → назови владельцу проект и найденные термины и получи подтверждение одним словом: установка пишет в папку его проекта, поэтому согласие обязательно. После «да» комплект ставится в **отдельную подпапку** `neuro-lab-vps` этого проекта (шаг 4); файлы проекта, его `CLAUDE.md`, `AGENTS.md`, `STATUS` и конфигурация не меняются и не заменяются, **параллельный VPS-проект не создаётся**.
@@ -203,8 +203,8 @@ param([string]$Target = '<TARGET_FOLDER_PLACEHOLDER>')
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $Repo   = 'https://github.com/siarheihuobi-hue/neuro-lab-vps'
-$Tag    = 'v0.2.0-preview'
-$Ver    = '0.2.0-preview'
+$Tag    = 'v0.3.0-preview'
+$Ver    = '0.3.0-preview'
 $Zip    = 'neurokomanda-vps-kit-' + $Ver + '.zip'
 if ($Target -like '*PLACEHOLDER*') { throw 'TARGET_NOT_CHOSEN: agree the folder with the owner first; nothing done.' }
 function Get-Release([string]$Uri, [string]$Out) {
@@ -282,8 +282,8 @@ else {
 # BOOTSTRAP-SH:BEGIN
 set -eu
 REPO='https://github.com/siarheihuobi-hue/neuro-lab-vps'
-TAG='v0.2.0-preview'
-VER='0.2.0-preview'
+TAG='v0.3.0-preview'
+VER='0.3.0-preview'
 TARGET="${1:-<TARGET_FOLDER_PLACEHOLDER>}"
 ZIP="neurokomanda-vps-kit-$VER.zip"
 case "$TARGET" in *PLACEHOLDER*) echo "TARGET_NOT_CHOSEN: agree the folder with the owner first; nothing done."; exit 2 ;; esac
@@ -338,7 +338,7 @@ echo "INSTALLED $VER"
 
 **Вариант B: с Git (если Git уже есть).** Только в пустую или несуществующую папку, не внутрь чужого репозитория:
 ```
-git clone --depth 1 --branch v0.2.0-preview https://github.com/siarheihuobi-hue/neuro-lab-vps.git <TARGET_FOLDER_PLACEHOLDER>
+git clone --depth 1 --branch v0.3.0-preview https://github.com/siarheihuobi-hue/neuro-lab-vps.git <TARGET_FOLDER_PLACEHOLDER>
 ```
 `.gitattributes` репозитория фиксирует окончания строк LF, поэтому хеши в `MANIFEST.sha256` совпадают и на Windows. После клонирования проверь `MANIFEST.sha256` (шаг 5). `state/` исключён `.gitignore` комплекта: состояние участника не попадёт в коммиты.
 
@@ -361,8 +361,8 @@ param([string]$Target = '<TARGET_FOLDER_PLACEHOLDER>', [string]$Rollback = '')
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $Repo   = 'https://github.com/siarheihuobi-hue/neuro-lab-vps'
-$Tag    = 'v0.2.0-preview'
-$Ver    = '0.2.0-preview'
+$Tag    = 'v0.3.0-preview'
+$Ver    = '0.3.0-preview'
 $Zip    = 'neurokomanda-vps-kit-' + $Ver + '.zip'
 if ($Target -like '*PLACEHOLDER*') { throw 'TARGET_NOT_CHOSEN: agree the folder with the owner first; nothing done.' }
 $Backups = Join-Path $Target '.upgrade-backups'
@@ -553,8 +553,8 @@ macOS (и Linux) (`bash <файл> <папка комплекта>`; откат:
 # UPGRADE-SH:BEGIN
 set -u
 REPO='https://github.com/siarheihuobi-hue/neuro-lab-vps'
-TAG='v0.2.0-preview'
-VER='0.2.0-preview'
+TAG='v0.3.0-preview'
+VER='0.3.0-preview'
 TARGET="${1:-<TARGET_FOLDER_PLACEHOLDER>}"
 ROLLBACK="${2:-}"
 ZIP="neurokomanda-vps-kit-$VER.zip"
